@@ -1,0 +1,11 @@
+# local target lists — never commit your asset inventory
+assets.txt
+hosts.txt
+*.local
+
+# python
+__pycache__/
+*.pyc
+
+# os
+.DS_Store

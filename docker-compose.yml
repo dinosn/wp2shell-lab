@@ -1,0 +1,35 @@
+# wp2shell lab — stock WordPress + MySQL, no plugins.
+# WP_TAG selects the image: 6.9.4 = vulnerable (default), 7.0.2 = patched.
+#   WP_TAG=6.9.4 docker compose up -d   # vulnerable
+#   WP_TAG=7.0.2 docker compose up -d    # patched
+#
+# The DB user gets the mysql-image default (ALL ON wordpress.*), which excludes the global
+# FILE privilege — this models a normal/managed host, where the chain is a read-only SQLi.
+name: wp2shell-lab
+
+services:
+  db:
+    image: mysql:8.0
+    environment:
+      MYSQL_DATABASE: wordpress
+      MYSQL_USER: wordpress
+      MYSQL_PASSWORD: wordpress
+      MYSQL_ROOT_PASSWORD: rootpw
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "--silent"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+
+  wordpress:
+    image: wordpress:${WP_TAG:-6.9.4}
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${WP_PORT:-8093}:80"
+    environment:
+      WORDPRESS_DB_HOST: db:3306
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: wordpress
+      WORDPRESS_DB_NAME: wordpress
