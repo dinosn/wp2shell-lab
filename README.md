@@ -86,7 +86,9 @@ $ make patched
 ## The detector (`wp2shell_check.py`)
 
 Standard library only. **Non-destructive:** a time-based differential (fast vs. injected `SLEEP`)
-confirms the injection without reading data or changing state. `--proof` reads only `@@version` and
+confirms the injection without reading data or changing state. The `SLEEP` is wrapped in a derived
+table — `(SELECT 1 FROM (SELECT SLEEP(n))x)` — so it evaluates once regardless of row count; a bare
+`SLEEP()` is optimized away on some managed hosts and would read as a false negative. `--proof` reads only `@@version` and
 `current_user()` via a bounded blind read, as hard evidence for a ticket. It **does not** attempt
 code execution or extract sensitive data.
 

