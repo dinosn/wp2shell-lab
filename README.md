@@ -96,16 +96,34 @@ code execution or extract sensitive data.
 # your own single asset (remote targets require an authorization assertion)
 python3 wp2shell_check.py https://your-site.example --authorized
 
-# a list of assets you own, JSON out
-python3 wp2shell_check.py -f assets.txt --authorized --json
+# a large list of assets you own — 20 concurrent workers, JSON out
+python3 wp2shell_check.py -f assets.txt --authorized -t 20 --json > results.json
+# live progress + a summary line (vulnerable / affected_version / not_vulnerable / error)
+# print to stderr; the JSON on stdout preserves input order.
 
 # through Burp
 python3 wp2shell_check.py http://127.0.0.1:8093 --proxy http://127.0.0.1:8080
 ```
 
-Options: `--sleep N` (injected delay, default 4), `--rounds N` (median over N probes),
-`--route auto|rest-route|wp-json`, `--timeout N`, `--proof`, `--json`, `--authorized`.
-Exit codes: `0` vulnerable, `1` not vulnerable, `2` inconclusive/error.
+Options: `-t/--threads N` (concurrent workers for `-f` scans, default 10), `--sleep N` (injected
+delay, default 4), `--rounds N` (median over N probes), `--route auto|rest-route|wp-json`,
+`--timeout N`, `--proof`, `--json`, `--authorized`. Timing detection stays reliable under
+concurrency because the multi-second `SLEEP` dominates network jitter; each host is scanned by an
+independent client with no shared state.
+
+**Status values**
+- `vulnerable` — actively confirmed via the injection (batch confusion, 6.9.0–7.0.1).
+- `affected_version` — the fingerprinted version is in an affected range but the active check
+  didn't fire. Two cases: **6.8.0–6.8.5** has the `author__not_in` SQLi sink (CVE-2026-60137, fixed
+  6.8.6) but *not* the 6.9+ batch-route confusion that delivers it unauthenticated, so it can't be
+  actively confirmed; or a WAF/edge blocked the probe on a 6.9+ host. Version-based, not proof.
+- `not_vulnerable` — active check negative and version outside the affected ranges.
+
+Exit codes: `0` = needs attention (vulnerable **or** affected_version), `1` = not vulnerable, `2` = error.
+
+**Robustness:** follows redirects while **preserving the POST body** (a site that redirects
+`http→https` or to a canonical host won't silently drop the batch payload), canonicalizes the host
+once up front, and **ignores TLS errors** (`curl -k`) so broken certs don't abort a scan.
 
 ---
 

